@@ -2,7 +2,7 @@
   "name": "VGCI Finished Goods Inventory",
   "short_name": "VGCI FG",
   "description": "Village Gourmet Company Inc. - Finished Goods Inventory Management System",
-  "start_url": "./index.html",
+  "start_url": "./index.html?v=3",
   "scope": "./",
   "display": "standalone",
   "display_override": ["standalone"],
