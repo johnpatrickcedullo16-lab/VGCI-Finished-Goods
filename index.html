@@ -1,48 +1,3898 @@
-<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<title>VGCI FG Inventory</title>
-<meta name="theme-color" content="#1f6b47">
-<meta name="mobile-web-app-capable" content="yes">
-<link rel="manifest" href="manifest.json">
-<link rel="icon" href="icon-192.png">
-<link rel="apple-touch-icon" href="apple-touch-icon.png">
-<style>
-  :root{--green:#1f6b47}
-  html,body{margin:0;height:100%;background:#fff;overflow:hidden;font-family:Arial,sans-serif}
-  #app{position:fixed;inset:0;width:100%;height:100%;border:0;display:block}
-  #splash{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:18px;background:#fff;z-index:2;transition:opacity .3s}
-  #splash img{width:220px;max-width:60vw}
-  #splash .bar{width:160px;height:4px;border-radius:4px;background:#e4eee8;overflow:hidden}
-  #splash .bar i{display:block;width:40%;height:100%;background:var(--green);animation:load 1.1s ease-in-out infinite}
-  @keyframes load{0%{transform:translateX(-100%)}100%{transform:translateX(250%)}}
-  #splash p{margin:0;color:#66736b;font-size:14px}
-  #offline{display:none;position:fixed;left:0;right:0;top:0;padding:10px 14px;background:#a73535;color:#fff;font-size:14px;text-align:center;z-index:3}
-</style>
-</head>
-<body>
-<div id="offline">No internet connection. The app will reload when you are back online.</div>
-<div id="splash"><img src="icon-512.png" alt="VGCI"><div class="bar"><i></i></div><p>Loading VGCI Finished Goods Inventory…</p></div>
-<iframe id="app" title="VGCI FG Inventory" allow="clipboard-read; clipboard-write; camera; fullscreen"></iframe>
-<script>
-  // ===== The only setting: your Apps Script web app link (Deploy > Manage deployments) =====
-       const APP_URL = 'https://script.google.com/macros/s/AKfycbyeSr5Ux3RHJAZu3ucy2JlFrcrmtIA5_lkwZBuefAXy2w0lw8LlFIKDXSAkoAQODC2olg/exec';
+/**
+ * VGCI Finished Goods Inventory Management System
+ * WORKFLOW ADJUSTMENTS V90
+ * Google Sheets + Apps Script
+ *
+ * Active modules only:
+ * Dashboard, Product Transfer Receipt, Inventory Count,
+ * Metal Detector, Institutional, Transactions.
+ *
+ * Removed completely from active code:
+ * Offline queue/sync, Allocation/Transfer module, legacy V22-V48 handlers.
+ */
 
-  const frame = document.getElementById('app');
-  const splash = document.getElementById('splash');
-  // Pass any ?parameters (e.g. QR traceability links) through to the app.
-  frame.src = APP_URL + (location.search || '');
-  frame.addEventListener('load', () => { splash.style.opacity = '0'; setTimeout(() => splash.remove(), 350); });
-  setTimeout(() => { if (document.body.contains(splash)) { splash.style.opacity = '0'; setTimeout(() => splash.remove(), 350); } }, 15000);
+const FG_CFG = {
+  TZ: 'Asia/Manila',
+  SHEETS: {
+    PRODUCTS: 'Product Master',
+    CUSTOMER_PRODUCTS: 'Customer Products',
+    SUPERMARKET_PRODUCTS: 'Supermarket Products',
+    TRANSMITTAL: 'Transmittal',
+    RECEIVING: 'FG Receiving',
+    INVENTORY: 'Inventory Count',
+    TRANSACTIONS: 'Transactions',
+    METAL: 'Metal Detector',
+    LISTS: 'Lists',
+    METAL_MONITORING: 'Metal Detector Monitoring',
+    ALLOCATION: 'Allocation',
+    PERSONNEL: 'Personnel Master',
+    CUSTOMER_MASTER: 'Customer Master',
+    USERS: 'Users',
+    PDR: 'Product Disposition Report',
+    HOLDING_TIME: 'Holding Time Master'
+  }
+};
 
-  const off = document.getElementById('offline');
-  addEventListener('offline', () => off.style.display = 'block');
-  addEventListener('online',  () => { off.style.display = 'none'; frame.src = frame.src; });
-  if (!navigator.onLine) off.style.display = 'block';
 
-  if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
-</script>
-</body>
-</html>
+/* ==================== V135 MULTI-USER CONCURRENCY ====================
+   EVERY function that writes to the spreadsheet goes through withWriteLock_.
+   - Saves from different users are queued one at a time (waits up to 30s).
+   - Reference numbers (TR / AL / MD / PDR) are re-checked INSIDE the lock,
+     so two users with the same number on screen can never create duplicates.
+   - Reentrant: a locked save can call helpers that also need the lock.
+   Reads and page loading remain concurrent for all users.
+====================================================================== */
+var FG_LOCK_DEPTH_ = 0;
+
+function withWriteLock_(fn){
+  if (FG_LOCK_DEPTH_ > 0) return fn();           // already holding the lock
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(30000)) {
+    throw new Error('Another user is currently saving. Please wait a moment and try again.');
+  }
+  FG_LOCK_DEPTH_++;
+  try {
+    const out = fn();
+    SpreadsheetApp.flush();                        // commit before the next user reads
+    bumpDataVersion_();                            // tell other tablets something changed
+    return out;
+  } finally {
+    FG_LOCK_DEPTH_--;
+    lock.releaseLock();
+  }
+}
+
+function hasWriteLock_(){ return FG_LOCK_DEPTH_ > 0; }
+
+/* ==================== V135 LIVE REFRESH (lightweight) ====================
+   Every successful save stamps a "data version" in the script cache (memory,
+   not the spreadsheet). Tablets ask getLiveStatus_() every ~30s:
+   - nothing changed -> one cache read, no sheet access (very fast)
+   - something changed -> returns only the transfer lists (Transmittal +
+     FG Receiving sheets), not the full app data.
+========================================================================== */
+function dataVersion_(){
+  const cache = CacheService.getScriptCache();
+  let v = cache.get('FG_DATA_VER');
+  if (!v) { v = String(Date.now()); cache.put('FG_DATA_VER', v, 21600); }
+  return v;
+}
+function bumpDataVersion_(){
+  try { CacheService.getScriptCache().put('FG_DATA_VER', String(Date.now()), 21600); } catch (_) {}
+}
+function getLiveStatus_(clientVer){
+  const ver = dataVersion_();
+  const sys = {maintenance: maint_(), appVersion: FG_APP_VERSION};
+  if (clientVer && String(clientVer) === ver) return {ver: ver, changed: false, maintenance: sys.maintenance, appVersion: sys.appVersion};
+  return {
+    ver: ver,
+    changed: true,
+    maintenance: sys.maintenance,
+    appVersion: sys.appVersion,
+    pendingTransfers: pendingTransfers_(),
+    savedTransfers: savedTransfers_(),
+    receivedTransfers: receivedTransfers_(),
+    nextTransferNo: nextTransferNo_(),
+    // V139f: master lists too, so tablets that stay open see new products / customers
+    products: getProducts_(),
+    customers: getCustomers_(),
+    customerGroups: getCustomerGroups_(),
+    supermarketGroups: getSupermarketGroups_(),
+    supermarketProducts: getSupermarketProducts_(),
+    fgReturns: listFgReturns_(),
+    dashboard: dashboard_()
+  };
+}
+
+/** True if `value` already exists in column `col` (1-based) of sheet `sh`, from row 2 down. */
+function valueExistsInColumn_(sh, col, value){
+  const v = s_(value).toUpperCase();
+  if (!v || sh.getLastRow() < 2) return false;
+  return sh.getRange(2, col, sh.getLastRow() - 1, 1).getDisplayValues()
+    .some(r => s_(r[0]).toUpperCase() === v);
+}
+
+/* ==================== V137 SESSIONS + SERVER-SIDE PERMISSIONS ====================
+   - The browser calls ONLY api(fn, args, token). All other functions end in "_"
+     so they cannot be called directly from the browser console.
+   - Login creates a session token (kept in CacheService). Refreshing the page
+     keeps the user logged in. 15 minutes without activity = logged out.
+   - Every save is checked against the user's role on the SERVER, not just by
+     hiding menu buttons.
+====================================================================================== */
+const FG_IDLE_MINUTES = 15;
+
+// Pages each role may open (single source of truth; sent to the browser at login).
+const FG_PAGE_ACCESS = {
+  ADMIN:     ['dashboard','transmittal','fgreceiving','metal','pdr','inventory','allocation','institutional','traceability','transactions','products','personnel'],
+  PRESIDENT: ['dashboard','transmittal','fgreceiving','metal','pdr','inventory','allocation','institutional','traceability','transactions'],
+  MANAGER:   ['dashboard','transmittal','fgreceiving','metal','pdr','inventory','allocation','institutional','traceability','transactions','products'],
+  FG:        ['dashboard','fgreceiving','metal','pdr','inventory','allocation','institutional','traceability','transactions'],
+  PRODUCTION:['dashboard','transmittal','inventory','traceability','transactions']
+};
+const FG_INVENTORY_EDIT_ROLES = ['ADMIN','PRESIDENT','MANAGER','FG'];
+
+// Write actions -> the page the user must have access to.
+const FG_WRITE_RULES = {
+  saveTransfer:             {page:'transmittal',   fn:function(a){return saveTransfer_(a[0]);}},
+  receiveTransfer:          {page:'fgreceiving',   fn:function(a){return receiveTransfer_(a[0]);}},
+  saveMetalMonitoringBatch: {page:'metal',         fn:function(a){return saveMetalMonitoringBatch_(a[0]);}},
+  saveMetalMonitoring:      {page:'metal',         fn:function(a){return saveMetalMonitoring_(a[0]);}},
+  saveMetalDetectionPage2:  {page:'metal',         fn:function(a){return saveMetalDetectionPage2_(a[0]);}},
+  saveMetalDetectorIncident:{page:'metal',         fn:function(a){return saveMetalDetectorIncident_(a[0]);}},
+  savePDR:                  {page:'pdr',           fn:function(a){return savePDR_(a[0]);}},
+  saveLapsedQADecision:     {page:'inventory', roles:FG_INVENTORY_EDIT_ROLES, fn:function(a){return saveLapsedQADecision_(a[0]);}},
+  editInventoryBatch:       {page:'inventory', roles:FG_INVENTORY_EDIT_ROLES, fn:function(a){return editInventoryBatch_(a[0]);}},
+  verifyInventoryEditorPin: {page:'inventory', roles:FG_INVENTORY_EDIT_ROLES, fn:function(a){return verifyInventoryEditorPin_(a[0]);}},
+  saveAllocation:           {page:'allocation',    fn:function(a){return saveAllocation_(a[0]);}},
+  saveReallocation:         {page:'allocation',    fn:function(a){return saveReallocation_(a[0]);}},
+  saveInstitutionalCustomer:{page:'institutional', fn:function(a){return saveInstitutionalCustomer_(a[0]);}},
+  savePersonnel:            {page:'personnel',     fn:function(a){return savePersonnel_(a[0]);}},
+  saveCustomer:             {page:'personnel',     fn:function(a){return saveCustomer_(a[0]);}},
+  saveUserAccess:           {roles:['ADMIN'],      fn:function(a){return saveUserAccess_(a[0]);}},
+  getAllUsersAdmin:         {roles:['ADMIN'],      fn:function(a){return getAllUsersAdmin_();}},
+  runDuplicateCheck:        {roles:['ADMIN'],      fn:function(a){return runDuplicateCheck_();}},
+  getProductAdminData:      {page:'products', roles:['ADMIN','MANAGER'], fn:function(a){return getProductAdminData_();}},
+  saveProduct:              {page:'products', roles:['ADMIN','MANAGER'], fn:function(a){return saveProduct_(a[0]);}},
+  processFgReturn:          {page:'transmittal', fn:function(a){return processFgReturn_(a[0]);}},
+  setMaintenance:           {roles:['ADMIN'], fn:function(a){return setMaintenance_(a[0]);}},
+  previewSupermarketImport: {roles:['ADMIN'], fn:function(a){return previewSupermarketImport_();}},
+  applySupermarketImport:   {roles:['ADMIN'], fn:function(a){return applySupermarketImport_();}}
+};
+
+// Read actions: any logged-in user.
+const FG_READ_FNS = {
+  getAppData:getAppData_, getAppBootstrapData:getAppBootstrapData_, getLiveStatus:getLiveStatus_,
+  getAllocationData:getAllocationData_, getReallocationHistory:getReallocationHistory_,
+  getFGInventoryPrintData:getFGInventoryPrintData_, getInstitutionalCustomerEditorData:getInstitutionalCustomerEditorData_,
+  getInstitutionalData:getInstitutionalData_, getInventoryData:getInventoryData_, getInventoryEditors:getInventoryEditors_,
+  getInventoryPinStatus:getInventoryPinStatus_, getMetalDetectionQueue:getMetalDetectionQueue_,
+  getMetalDetectorRecord:getMetalDetectorRecord_, getMetalMonitoringBatchRecords:getMetalMonitoringBatchRecords_,
+  getMetalMonitoringRecord:getMetalMonitoringRecord_, getNextMetalIncidentNo:getNextMetalIncidentNo_,
+  getNextMetalMonitoringNo:getNextMetalMonitoringNo_, getPDRData:getPDRData_, getPDRPrintData:getPDRPrintData_,
+  getPDRRecord:getPDRRecord_, getPersonnel:getPersonnel_, getProductCodeTraceability:getProductCodeTraceability_,
+  getProductTraceability:getProductTraceability_, getTraceabilityCodes:getTraceabilityCodes_,
+  getTraceabilityProducts:getTraceabilityProducts_, getTransactions:getTransactions_,
+  getTransferPrintData:getTransferPrintData_, getTransferredItemTagData:getTransferredItemTagData_,
+  hasMetalIncident:hasMetalIncident_, listMetalIncidents:listMetalIncidents_, listMetalMonitoring:listMetalMonitoring_,
+  getJulianCode:getJulianCode_, getFgReturns:function(){return listFgReturns_();}
+};
+
+var FG_SESSION_ = null;   // the logged-in user for the current server call
+
+function sessionKey_(token){ return 'FG_SESS_' + token; }
+
+function createSession_(username, role){
+  const token = Utilities.getUuid().replace(/-/g,'') + Utilities.getUuid().replace(/-/g,'');
+  const sess = {u:username, r:role, last:Date.now()};
+  CacheService.getScriptCache().put(sessionKey_(token), JSON.stringify(sess), 21600);
+  return token;
+}
+
+function readSession_(token, touch){
+  if(!token) return null;
+  const cache = CacheService.getScriptCache();
+  const raw = cache.get(sessionKey_(token));
+  if(!raw) return null;
+  const sess = JSON.parse(raw);
+  if(Date.now() - n_(sess.last) > FG_IDLE_MINUTES*60000){ cache.remove(sessionKey_(token)); return null; }
+  // Re-check the Users sheet so a deactivated user / changed role takes effect immediately.
+  // (Skipped for the 30-second background live-refresh to keep it fast.)
+  if(touch){
+    const live = getUsers_().find(x => x.username.toUpperCase() === s_(sess.u).toUpperCase());
+    if(!live){ cache.remove(sessionKey_(token)); return null; }
+    sess.r = live.role;
+  }
+  if(touch){ sess.last = Date.now(); cache.put(sessionKey_(token), JSON.stringify(sess), 21600); }
+  return sess;
+}
+
+function sessionPayload_(username, role, token){
+  return {ok:true, token:token, username:username, role:role,
+          pages:(FG_PAGE_ACCESS[role]||['dashboard']), idleMinutes:FG_IDLE_MINUTES,
+          permissions:rolePermissions_(role)};
+}
+
+function sessionExpired_(){
+  throw new Error('SESSION_EXPIRED: Your session has ended (15 minutes without activity or logged out). Please log in again.');
+}
+
+/** The ONLY entry point the browser uses. */
+function api(fn, args, token){
+  // V139e: google.script.run turns the WHOLE answer into null if it contains a Date
+  // anywhere. Convert every answer to plain JSON so one stray Date can never blank the app.
+  const out = apiCore_(fn, args, token);
+  return out === undefined ? null : JSON.parse(JSON.stringify(out));
+}
+
+function apiCore_(fn, args, token){
+  fn = s_(fn); args = Array.isArray(args) ? args : [];
+
+  // Public (no login needed)
+  if(fn === 'getLoginUsers') return getLoginUsers_();
+  if(fn === 'getSystemStatus') return systemStatus_();
+  if(fn === 'loginUser'){
+    const auth = loginUser_(args[0], args[1]);
+    if(maint_().on && auth.role !== 'ADMIN') maintenanceError_();
+    return sessionPayload_(auth.username, auth.role, createSession_(auth.username, auth.role));
+  }
+  if(fn === 'resumeSession'){
+    const s = readSession_(args[0], true);
+    if(!s) sessionExpired_();
+    if(maint_().on && s.r !== 'ADMIN') maintenanceError_();   // session is kept for after maintenance
+    return sessionPayload_(s.u, s.r, args[0]);
+  }
+  if(fn === 'logoutSession'){
+    if(args[0]) CacheService.getScriptCache().remove(sessionKey_(args[0]));
+    return {ok:true};
+  }
+
+  // Everything else requires a valid session. Background live-refresh does not count as activity.
+  const sess = readSession_(token, fn !== 'getLiveStatus');
+  if(!sess) sessionExpired_();
+  FG_SESSION_ = {username:sess.u, role:sess.r};
+
+  // V145 maintenance mode: only ADMIN may use the system. Others only get the status.
+  const m = maint_();
+  if(m.on && sess.r !== 'ADMIN'){
+    if(fn === 'getLiveStatus') return {ver:'', changed:false, maintenance:m, appVersion:FG_APP_VERSION};
+    maintenanceError_();
+  }
+
+  const rule = FG_WRITE_RULES[fn];
+  if(rule){
+    const pages = FG_PAGE_ACCESS[sess.r] || [];
+    if(rule.page && pages.indexOf(rule.page) < 0)
+      throw new Error('Access denied: your role ('+sess.r+') cannot do this action.');
+    if(rule.roles && rule.roles.indexOf(sess.r) < 0)
+      throw new Error('Access denied: your role ('+sess.r+') cannot do this action.');
+    return rule.fn(args);
+  }
+  const read = FG_READ_FNS[fn];
+  if(read) return read.apply(null, args);
+  throw new Error('Unknown action: ' + fn);
+}
+
+function doGet() {
+  return HtmlService.createHtmlOutputFromFile('Index')
+    .setTitle('VGCI Finished Goods Inventory')
+    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+}
+
+function ss_() {
+  return SpreadsheetApp.getActiveSpreadsheet();
+}
+
+function sheet_(name) {
+  const sh = ss_().getSheetByName(name);
+  if (!sh) throw new Error('Missing required sheet: ' + name);
+  return sh;
+}
+
+// V137: during read-only requests each sheet is read once per request (not once per item).
+var FG_ROWS_CACHE_ = {};
+function rows_(name) {
+  if (!hasWriteLock_() && FG_ROWS_CACHE_[name]) return FG_ROWS_CACHE_[name].slice();
+  const out = rowsRaw_(name);
+  if (!hasWriteLock_()) FG_ROWS_CACHE_[name] = out;
+  return out.slice();
+}
+
+function rowsRaw_(name) {
+  const sh = sheet_(name);
+  if (sh.getLastRow() < 2) return [];
+  return sh.getRange(2, 1, sh.getLastRow() - 1, sh.getLastColumn()).getValues();
+}
+
+function s_(v) {
+  return String(v == null ? '' : v).trim();
+}
+
+function n_(v) {
+  const x = Number(v);
+  return isFinite(x) ? x : 0;
+}
+
+function today_() {
+  return Utilities.formatDate(new Date(), FG_CFG.TZ, 'yyyy-MM-dd');
+}
+
+function dateText_(v, pattern) {
+  if (!v) return '';
+  const d = v instanceof Date ? v : new Date(v);
+  if (isNaN(d.getTime())) return s_(v);
+  return Utilities.formatDate(d, FG_CFG.TZ, pattern || 'yyyy-MM-dd');
+}
+
+function dateTimeText_(v) {
+  if (!v) return '';
+  const d = v instanceof Date ? v : new Date(v);
+  if (isNaN(d.getTime())) return s_(v);
+  return Utilities.formatDate(d, FG_CFG.TZ, 'dd-MMM-yyyy hh:mm a');
+}
+
+function dateObj_(yyyyMmDd) {
+  return new Date((yyyyMmDd || today_()) + 'T00:00:00');
+}
+
+function getJulianCode_(dateValue) {
+  const d = dateObj_(dateValue);
+  const start = new Date(d.getFullYear(), 0, 0);
+  return String(Math.floor((d - start) / 86400000)).padStart(3, '0');
+}
+
+function ensureColumns_(sh, count) {
+  if (sh.getMaxColumns() < count) {
+    sh.insertColumnsAfter(sh.getMaxColumns(), count - sh.getMaxColumns());
+  }
+}
+
+function ensureReceiving_() {
+  const sh = sheet_(FG_CFG.SHEETS.RECEIVING);
+  ensureColumns_(sh, 13);
+  if (!s_(sh.getRange(1, 13).getValue())) sh.getRange(1, 13).setValue('Noted By');
+}
+
+function metalSheet_() {
+  let sh = ss_().getSheetByName(FG_CFG.SHEETS.METAL);
+  if (!sh) {
+    sh = ss_().insertSheet(FG_CFG.SHEETS.METAL);
+    sh.getRange(1,1,1,15).setValues([[
+      'Incident No.','Date','Time','Transfer No.','Item','Internal Code',
+      'Affected Qty','Detection Result','Metal / Foreign Material Description',
+      'Location / Detector','Action Taken','Disposition','Checked By',
+      'Verified By','Remarks'
+    ]]);
+    sh.setFrozenRows(1);
+  }
+  return sh;
+}
+
+function nextTransferNo_() {
+  const sh = sheet_(FG_CFG.SHEETS.TRANSMITTAL);
+  const prefix = 'TR-' + Utilities.formatDate(new Date(), FG_CFG.TZ, 'yyyyMMdd') + '-';
+  let max = 0;
+  if (sh.getLastRow() >= 2) {
+    sh.getRange(2,2,sh.getLastRow()-1,1).getDisplayValues().flat().forEach(v => {
+      const t = s_(v);
+      if (t.indexOf(prefix) === 0) {
+        const x = parseInt(t.substring(prefix.length),10);
+        if (isFinite(x)) max = Math.max(max,x);
+      }
+    });
+  }
+  return prefix + String(max + 1).padStart(3,'0');
+}
+
+function getNextMetalIncidentNo_() {
+  const sh = metalSheet_();
+  const y = Utilities.formatDate(new Date(), FG_CFG.TZ, 'yyyy');
+  let max = 0;
+  if (sh.getLastRow() >= 2) {
+    sh.getRange(2,1,sh.getLastRow()-1,1).getDisplayValues().flat().forEach(v => {
+      const m = s_(v).match(/^MD-\d{4}-(\d+)$/i);
+      if (m) max = Math.max(max, Number(m[1]) || 0);
+    });
+  }
+  return 'MD-' + y + '-' + String(max + 1).padStart(4,'0');
+}
+
+
+const FG_HOLDING_TIME_SEED = [["French Baguette 21\"", "", 1, "1 day", "B1", "ACTIVE"], ["French Baguette 6.5\"", "", 1, "1 day", "B1", "ACTIVE"], ["French Batard", "", 1, "1 day", "B1", "ACTIVE"], ["Magoos", "", 1, "1 day", "B1", "ACTIVE"], ["Mini French Baguette", "", 1, "1 day", "B1", "ACTIVE"], ["Sourdough Baguette", "", 1, "1 day", "B1", "ACTIVE"], ["Sourdough Batard", "", 1, "1 day", "B1", "ACTIVE"], ["Sourdough Whole Wheat Batard", "", 1, "1 day", "B1", "ACTIVE"], ["Sourdough Hoagie Rolls", "", 1, "1 day", "B1", "ACTIVE"], ["Sourdough Soup Boule Med.", "", 1, "1 day", "B1", "ACTIVE"], ["Sourdough Loaf", "", 1, "1 day", "B1", "ACTIVE"], ["Rosemary Olive Oil Batard", "", 1, "1 day", "B1", "ACTIVE"], ["Pan de Payes/Country Loaf", "", 1, "1 day", "B1", "ACTIVE"], ["Parmesan Cheese Mini Loaves", "", 1, "1 day", "B1", "ACTIVE"], ["Seasoned Breadsticks", "", 1, "1 day", "B1", "ACTIVE"], ["Plain Bagels", "", 2, "2 days", "B1", "ACTIVE"], ["Blueberry Bagels", "", 2, "2 days", "B1", "ACTIVE"], ["Cinnamon Raisin Bagels", "", 2, "2 days", "B1", "ACTIVE"], ["Whole Wheat Banana Bagels", "", 2, "2 days", "B1", "ACTIVE"], ["Sesame Bagels", "", 2, "2 days", "B1", "ACTIVE"], ["Plain Bogels w/ B&W Sesame Seeds", "", 10, "10 days", "B1", "ACTIVE"], ["Whole Wheat Bogels", "", 10, "10 days", "B1", "ACTIVE"], ["Focaccia Whole Wheat Rosemary and Black Olives", "", 1, "1 day", "B1", "ACTIVE"], ["Focaccia Herbed Onion", "", 1, "1 day", "B1", "ACTIVE"], ["Focaccia Cheese Parmesan", "", 1, "1 day", "B1", "ACTIVE"], ["Sundried Tomato Focaccia", "", 2, "2 days", "B1", "ACTIVE"], ["English Muffins", "", 2, "2 days", "B1", "ACTIVE"], ["Ciabatta", "", 1, "1 day", "B1", "ACTIVE"], ["Whole Wheat Pandesal", "", 2, "2 days", "B1", "ACTIVE"], ["Plain Pandesal", "", 2, "2 days", "B1", "ACTIVE"], ["Garlic Loaf", "", 2, "2 days", "B1", "ACTIVE"], ["Vietnamese Baguette/Bahn Mi", "", 1, "1 day", "B1", "ACTIVE"], ["Rye Loaf (Whole)", "", 1, "1 day", "B1", "ACTIVE"], ["Multigrain Loaf (Whole)", "", 1, "1 day", "B1", "ACTIVE"], ["Rye Loaf (Half)", "", 1, "1 day", "B1", "ACTIVE"], ["Multigrain Loaf (Half)", "", 1, "1 day", "B1", "ACTIVE"], ["Whole Wheat Loaf Regular", "", 2, "2 days", "B1", "ACTIVE"], ["Whole Wheat Loaf Jumbo", "", 2, "2 days", "B1", "ACTIVE"], ["Plain Loaf Regular", "", 2, "2 days", "B1", "ACTIVE"], ["Plain Loaf Jumbo", "", 2, "2 days", "B1", "ACTIVE"], ["Plain Pita", "", 2, "2 days", "B1", "ACTIVE"], ["Whole Wheat Pita", "", 2, "2 days", "B1", "ACTIVE"], ["Breadcrumbs", "", 10, "10 days", "B1", "ACTIVE"], ["Flour Tortilla", "4\"", 4, "4 days", "B2", "ACTIVE"], ["Flour Tortilla", "5\"", 4, "4 days", "B2", "ACTIVE"], ["Flour Tortilla", "6\"", 4, "4 days", "B2", "ACTIVE"], ["Flour Tortilla", "8\"", 4, "4 days", "B2", "ACTIVE"], ["Flour Tortilla", "10\"", 4, "4 days", "B2", "ACTIVE"], ["Flour Tortilla", "12\"", 4, "4 days", "B2", "ACTIVE"], ["Whole Wheat Tortilla", "6\"", 4, "4 days", "B2", "ACTIVE"], ["Whole Wheat Tortilla", "8\"", 4, "4 days", "B2", "ACTIVE"], ["Whole Wheat Tortilla", "10\"", 4, "4 days", "B2", "ACTIVE"], ["Whole Wheat Tortilla", "12\"", 4, "4 days", "B2", "ACTIVE"], ["Plain Crust", "6\"", 3, "3 days", "B2", "ACTIVE"], ["Plain Crust", "10\"", 3, "3 days", "B2", "ACTIVE"], ["Plain Crust", "12\"", 3, "3 days", "B2", "ACTIVE"], ["Plain Crust", "14\"", 3, "3 days", "B2", "ACTIVE"], ["Plain Crust", "15\"", 3, "3 days", "B2", "ACTIVE"], ["Plain Crust", "16\"", 3, "3 days", "B2", "ACTIVE"], ["Plain Crust", "11X11\"", 3, "3 days", "B2", "ACTIVE"], ["Plain Crust", "4x12\"", 3, "3 days", "B2", "ACTIVE"], ["Plain Crust", "5x12\"", 3, "3 days", "B2", "ACTIVE"], ["Sweet Pizza (Pizza More)", "8\"", 3, "3 days", "B2", "ACTIVE"], ["Sweet Pizza (Pizza More)", "10\"", 3, "3 days", "B2", "ACTIVE"], ["Sweet Pizza (Pizza More)", "12\"", 3, "3 days", "B2", "ACTIVE"], ["Sweet Pizza (Pizza More)", "14\"", 3, "3 days", "B2", "ACTIVE"], ["Sweet Pizza (Pizza More)", "11X11\"", 2, "2 days", "B2", "ACTIVE"], ["Gourmet Pizza", "Personal Thin", 2, "2 days", "B2", "ACTIVE"], ["Gourmet Pizza", "Personal Thick", 2, "2 days", "B2", "ACTIVE"], ["Gourmet Pizza", "Large Thin", 2, "2 days", "B2", "ACTIVE"], ["Gourmet Pizza", "Large Thick", 2, "2 days", "B2", "ACTIVE"], ["Super Thin", "6\"", 3, "3 days", "B2", "ACTIVE"], ["Super Thin", "8\"", 3, "3 days", "B2", "ACTIVE"], ["Super Thin", "10\"", 3, "3 days", "B2", "ACTIVE"], ["Super Thin", "12\"", 3, "3 days", "B2", "ACTIVE"], ["Super Thin", "14\"", 3, "3 days", "B2", "ACTIVE"], ["Pizo Pizza", "8x20\"", 2, "2 days", "B2", "ACTIVE"], ["Pizo Pizza", "10x15\"", 2, "2 days", "B2", "ACTIVE"], ["Flat Bread", "10x4\"", 1, "1 day", "B2", "ACTIVE"], ["Flat Bread", "12x9\"", 1, "1 day", "B2", "ACTIVE"], ["Slider Buns", "3\"", 2, "2 days", "B2", "ACTIVE"], ["Brioche Buns", "4\"", 2, "2 days", "B2", "ACTIVE"], ["Brioche Buns w/ Black Sesame", "4\"", 2, "2 days", "B2", "ACTIVE"], ["Brioche Buns w/ B&W Sesame", "4\"", 2, "2 days", "B2", "ACTIVE"], ["Brioche Buns", "4.5\"", 2, "2 days", "B2", "ACTIVE"], ["Brioche Buns w/ Black Sesame", "4.5\"", 2, "2 days", "B2", "ACTIVE"], ["Brioche Buns w/ B&W Sesame", "4.5\"", 2, "2 days", "B2", "ACTIVE"], ["Brioche Hotdog Buns", "6\"", 2, "2 days", "B2", "ACTIVE"], ["Brioche Hotdog Buns (60g)", "6\"", 2, "2 days", "B2", "ACTIVE"], ["Brioche Buns (Llao Llao) (L001)", "4.5\"", 2, "2 days", "B2", "ACTIVE"], ["Brioche Buns (B&W) (L001)", "4\"", 2, "2 days", "B2", "ACTIVE"], ["Plain Burger Buns", "4\"", 2, "2 days", "B2", "ACTIVE"], ["Plain Hotdog Buns", "6\"", 2, "2 days", "B2", "ACTIVE"], ["Kaiser Buns", "4\"", 2, "2 days", "B2", "ACTIVE"], ["Kaiser Buns w/ Black Sesame", "4\"", 2, "2 days", "B2", "ACTIVE"], ["Kaiser Buns w/ B&W Sesame", "4\"", 2, "2 days", "B2", "ACTIVE"], ["Kaiser Buns", "4.5\"", 2, "2 days", "B2", "ACTIVE"], ["Kaiser Buns w/ Black Sesame", "4.5\"", 2, "2 days", "B2", "ACTIVE"], ["Kaiser Buns w/ B&W Sesame", "4.5\"", 2, "2 days", "B2", "ACTIVE"], ["Regular Croissant", "-", 4, "4 days", "B2", "ACTIVE"], ["Mini Croissant", "-", 4, "4 days", "B2", "ACTIVE"], ["Pain Au Chocolat", "-", 4, "4 days", "B2", "ACTIVE"], ["Mini Pain Au Chocolat", "-", 4, "4 days", "B2", "ACTIVE"], ["Puff Pastry", "12x12\"", 14, "2 weeks", "B2", "ACTIVE"], ["Croissant Sheets", "12x12\"", 14, "2 weeks", "B2", "ACTIVE"], ["Brioche Loaf (CMG)", "Jumbo", 2, "2 days", "B2", "ACTIVE"], ["Brioche Loaf (Llao Llao)", "Jumbo", 2, "2 days", "B2", "ACTIVE"]];
+
+function ensureHoldingTimeMaster_(){
+  let sh=ss_().getSheetByName(FG_CFG.SHEETS.HOLDING_TIME);
+  if(!sh){
+    sh=ss_().insertSheet(FG_CFG.SHEETS.HOLDING_TIME);
+    sh.getRange(1,1,1,6).setValues([['Product Name','Size / Variant','Holding Time Days','Source Holding Time','Area','Status']]);
+    if(FG_HOLDING_TIME_SEED.length)sh.getRange(2,1,FG_HOLDING_TIME_SEED.length,6).setValues(FG_HOLDING_TIME_SEED);
+    sh.setFrozenRows(1);
+  }
+  return sh;
+}
+
+function holdingNorm_(v){
+  return s_(v).toUpperCase()
+    .replace(/[“”″]/g,'"')
+    .replace(/&/g,' AND ')
+    .replace(/[-_/]+/g,' ')
+    .replace(/[(),.]/g,' ')
+    .replace(/\bLOAVES\b/g,'LOAF')
+    .replace(/\bBAGELS\b/g,'BAGEL')
+    .replace(/\bBUNS\b/g,'BUN')
+    .replace(/\bROLLS\b/g,'ROLL')
+    .replace(/\bMUFFINS\b/g,'MUFFIN')
+    .replace(/\bBREADSTICKS\b/g,'BREADSTICK')
+    .replace(/\s+/g,' ')
+    .trim();
+}
+
+// V135: Holding Time Master is read ONCE per server call (was once per inventory row).
+var FG_HT_ROWS_CACHE_ = null, FG_HT_INFO_CACHE_ = {};
+function holdingMasterRows_(){
+  if(FG_HT_ROWS_CACHE_) return FG_HT_ROWS_CACHE_;
+  const sh=ensureHoldingTimeMaster_();
+  FG_HT_ROWS_CACHE_ = sh.getLastRow()<2 ? [] : sh.getRange(2,1,sh.getLastRow()-1,6).getValues()
+    .filter(r=>s_(r[5]).toUpperCase()!=='INACTIVE' && n_(r[2])>0);
+  return FG_HT_ROWS_CACHE_;
+}
+
+function holdingTimeInfo_(item){
+  const key=holdingNorm_(item);
+  if(!FG_HT_INFO_CACHE_.hasOwnProperty(key)) FG_HT_INFO_CACHE_[key]=holdingTimeInfoUncached_(item);
+  return FG_HT_INFO_CACHE_[key];
+}
+
+function holdingTimeInfoUncached_(item){
+  const name=holdingNorm_(item);
+  if(!name)return {days:0,source:'',matchedProduct:'',size:'',status:'NO HT SET'};
+  const rows=holdingMasterRows_();
+  if(!rows.length)return {days:0,source:'',matchedProduct:'',size:'',status:'NO HT SET'};
+
+  // 1) Exact source product name.
+  const exact=rows.filter(r=>holdingNorm_(r[0])===name);
+  if(exact.length){
+    const unique=[...new Set(exact.map(r=>n_(r[2])))];
+    if(unique.length===1){
+      const r=exact[0];
+      return {days:n_(r[2]),source:s_(r[3]),matchedProduct:s_(r[0]),size:s_(r[1]),status:'MATCHED'};
+    }
+  }
+
+  // 2) Product + size/variant contained in the system product name.
+  let best=null;
+  rows.forEach(r=>{
+    const p=holdingNorm_(r[0]), size=holdingNorm_(r[1]);
+    if(!p||!size||size==='-')return;
+    const combined1=p+' '+size, combined2=p+' '+size;
+    const sizeBare=size.replace(/"/g,'').trim();
+    const nameBare=name.replace(/"/g,'').trim();
+    const sizeMatch=name.includes(size) || (sizeBare && nameBare.includes(sizeBare));
+    if(name===combined1 || name===combined2 || (name.includes(p)&&sizeMatch)){
+      if(!best || combined1.length>best.score)best={r:r,score:combined1.length};
+    }
+  });
+  if(best){
+    const r=best.r;
+    return {days:n_(r[2]),source:s_(r[3]),matchedProduct:s_(r[0]),size:s_(r[1]),status:'MATCHED'};
+  }
+
+  // 3) Safe base-name fallback only when all variants use the same HT.
+  const family=rows.filter(r=>{
+    const p=holdingNorm_(r[0]);
+    return p && (name===p || name.startsWith(p+' ') || p.startsWith(name+' '));
+  });
+  if(family.length){
+    const unique=[...new Set(family.map(r=>n_(r[2])))];
+    if(unique.length===1){
+      const r=family[0];
+      return {days:n_(r[2]),source:s_(r[3]),matchedProduct:s_(r[0]),size:s_(r[1]),status:'MATCHED'};
+    }
+  }
+  return {days:0,source:'',matchedProduct:'',size:'',status:'NO HT SET'};
+}
+
+function holdingDateInfo_(productionDate,item){
+  const ht=holdingTimeInfo_(item);
+  if(!productionDate || !ht.days)return {
+    holdingTimeDays:ht.days||0,lastValidDate:'',lapseDate:'',htStatus:ht.days?'NO PRODUCTION DATE':'NO HT SET'
+  };
+  const pd=productionDate instanceof Date ? new Date(productionDate) : dateObj_(dateText_(productionDate));
+  pd.setHours(0,0,0,0);
+  const last=new Date(pd); last.setDate(last.getDate()+ht.days);
+  const lapse=new Date(last); lapse.setDate(lapse.getDate()+1);
+  const now=dateObj_(today_()); now.setHours(0,0,0,0);
+  return {
+    holdingTimeDays:ht.days,
+    lastValidDate:dateText_(last),
+    lapseDate:dateText_(lapse),
+    htStatus:now>=lapse?'LAPSED':'AVAILABLE'
+  };
+}
+
+/* V135: This used to rewrite columns K:Q on EVERY page load / refresh, without a lock.
+   If user A was loading the dashboard while user B saved a QA decision, A's refresh
+   could write the OLD values back over B's save. Now it:
+   - only writes while holding the write lock (reads that can't get it quickly just skip),
+   - re-reads the sheet inside the lock, and
+   - only writes rows whose values actually changed. */
+function syncHoldingStatuses_(){
+  if(hasWriteLock_()) return syncHoldingStatusesLocked_();
+  const lock=LockService.getScriptLock();
+  if(!lock.tryLock(3000)) return;           // someone is saving; their save refreshes statuses
+  FG_LOCK_DEPTH_++;
+  try{ syncHoldingStatusesLocked_(); SpreadsheetApp.flush(); }
+  finally{ FG_LOCK_DEPTH_--; lock.releaseLock(); }
+}
+
+function htCellKey_(v){ return v instanceof Date ? 'D'+v.getTime() : 'S'+String(v==null?'':v); }
+
+function syncHoldingStatusesLocked_(){
+  const sh=sheet_(FG_CFG.SHEETS.INVENTORY);
+  ensureColumns_(sh,17);
+  const headers=['Holding Time Days','Last Valid Date','Lapse Date','HT Status','Quality Decision','Quality Remarks','Quality Decision Date & Time'];
+  const curHead=sh.getRange(1,11,1,7).getValues()[0].map(s_);
+  if(curHead.join('|')!==headers.join('|')) sh.getRange(1,11,1,7).setValues([headers]);
+  if(sh.getLastRow()<2)return;
+
+  const vals=sh.getRange(2,1,sh.getLastRow()-1,17).getValues();
+  const out=vals.map(r=>{
+    const qty=n_(r[6]), item=s_(r[3]), pd=r[5];
+    const h=holdingDateInfo_(pd,item);
+    const decision=s_(r[14]).toUpperCase();
+    const qRemarks=s_(r[15]);
+    let status=qty>0 ? h.htStatus : 'NO STOCK';
+
+    if(qty>0 && decision==='RELEASE')status='AVAILABLE - QA RELEASED';
+    if(qty>0 && decision==='EXTEND HOLD'){
+      const m=qRemarks.match(/EXTENDED UNTIL:\s*(\d{4}-\d{2}-\d{2})/i);
+      if(m){
+        const ext=dateObj_(m[1]); ext.setHours(0,0,0,0);
+        const now=dateObj_(today_()); now.setHours(0,0,0,0);
+        status=now<=ext?'AVAILABLE - EXTENDED':'LAPSED';
+      }
+    }
+    if(qty>0 && decision==='PDR')status='LAPSED - PDR';
+
+    return [h.holdingTimeDays,h.lastValidDate?dateObj_(h.lastValidDate):'',h.lapseDate?dateObj_(h.lapseDate):'',status,decision,qRemarks,r[16]||''];
+  });
+  // Write only contiguous blocks of rows that actually changed.
+  let i=0;
+  while(i<out.length){
+    const same=out[i].every((v,c)=>htCellKey_(v)===htCellKey_(vals[i][10+c]));
+    if(same){ i++; continue; }
+    let j=i+1;
+    while(j<out.length && !out[j].every((v,c)=>htCellKey_(v)===htCellKey_(vals[j][10+c]))) j++;
+    sh.getRange(2+i,11,j-i,7).setValues(out.slice(i,j));
+    i=j;
+  }
+}
+
+function productInfo_(item) {
+  const key = s_(item).toUpperCase();
+  const pm = rows_(FG_CFG.SHEETS.PRODUCTS);
+  for (let i=0;i<pm.length;i++) {
+    if (s_(pm[i][1]).toUpperCase() === key) {
+      return {
+        item: s_(pm[i][1]),
+        marketType: s_(pm[i][2]),
+        category: s_(pm[i][3]),
+        unit: 'PACK',
+        shelfLifeDays: n_(pm[i][5]),
+        productionArea: s_(pm[i][6])
+      };
+    }
+  }
+  const cp = rows_(FG_CFG.SHEETS.CUSTOMER_PRODUCTS);
+  for (let i=0;i<cp.length;i++) {
+    if (s_(cp[i][1]).toUpperCase() === key) {
+      return {
+        item: s_(cp[i][1]),
+        marketType: 'INSTITUTIONAL',
+        category: 'CUSTOMER PRODUCT',
+        unit: 'PACK',
+        shelfLifeDays: 0,
+        productionArea: ''
+      };
+    }
+  }
+  return {item:s_(item),marketType:'',category:'',unit:'PACK',shelfLifeDays:0,productionArea:''};
+}
+
+
+function ensurePersonnel_(){
+  let sh=ss_().getSheetByName(FG_CFG.SHEETS.PERSONNEL);
+  if(!sh){
+    sh=ss_().insertSheet(FG_CFG.SHEETS.PERSONNEL);
+    sh.getRange(1,1,1,4).setValues([['Name','Area / Role','Status','Date Added']]);
+    sh.setFrozenRows(1);
+  }
+  return sh;
+}
+
+function getPersonnel_(){
+  const sh=ensurePersonnel_();
+  if(sh.getLastRow()<2)return [];
+  return sh.getRange(2,1,sh.getLastRow()-1,4).getValues()
+    .map((r,i)=>({sheetRow:i+2,name:s_(r[0]),area:s_(r[1]),status:s_(r[2])||'ACTIVE',dateAdded:dateText_(r[3])}))
+    .filter(x=>x.name && x.status.toUpperCase()!=='INACTIVE')
+    .sort((a,b)=>a.name.localeCompare(b.name));
+}
+
+function savePersonnelCore_(payload) {
+  payload=payload||{};
+  const name=s_(payload.name), area=s_(payload.area), status=(s_(payload.status)||'ACTIVE').toUpperCase();
+  if(!name)throw new Error('Personnel name is required.');
+  const sh=ensurePersonnel_();
+  const data=sh.getLastRow()<2?[]:sh.getRange(2,1,sh.getLastRow()-1,4).getValues();
+  const rowNo=Number(payload.sheetRow)||0;
+  const row=[name,area,status,new Date()];
+  if(rowNo>=2 && rowNo<=sh.getLastRow()) sh.getRange(rowNo,1,1,4).setValues([row]);
+  else{
+    const dup=data.findIndex(r=>s_(r[0]).toUpperCase()===name.toUpperCase());
+    if(dup>=0) sh.getRange(dup+2,1,1,4).setValues([row]);
+    else sh.appendRow(row);
+  }
+  return {ok:true,personnel:getPersonnel_()};
+}
+
+function ensureCustomerMaster_(){
+  let sh=ss_().getSheetByName(FG_CFG.SHEETS.CUSTOMER_MASTER);
+  if(!sh){
+    sh=ss_().insertSheet(FG_CFG.SHEETS.CUSTOMER_MASTER);
+    sh.getRange(1,1,1,4).setValues([['Customer','Market Type','Status','Last Updated']]);
+    sh.setFrozenRows(1);
+  }
+  return sh;
+}
+
+function customerMasterRows_(){
+  const sh=ensureCustomerMaster_();
+  if(sh.getLastRow()<2)return [];
+  return sh.getRange(2,1,sh.getLastRow()-1,4).getValues()
+    .map((r,i)=>({sheetRow:i+2,customer:s_(r[0]),marketType:(s_(r[1])||'INSTITUTIONAL').toUpperCase(),status:(s_(r[2])||'ACTIVE').toUpperCase(),updated:dateText_(r[3])}));
+}
+
+function saveCustomerCore_(payload) {
+  payload=payload||{};
+  const customer=s_(payload.customer), market=(s_(payload.marketType)||'INSTITUTIONAL').toUpperCase();
+  const status=(s_(payload.status)||'ACTIVE').toUpperCase();
+  if(!customer)throw new Error('Customer name is required.');
+  const sh=ensureCustomerMaster_();
+  const rowNo=Number(payload.sheetRow)||0;
+  const row=[customer,market,status,new Date()];
+  if(rowNo>=2 && rowNo<=sh.getLastRow()) sh.getRange(rowNo,1,1,4).setValues([row]);
+  else{
+    const rows=customerMasterRows_();
+    const ex=rows.find(x=>x.customer.toUpperCase()===customer.toUpperCase());
+    if(ex) sh.getRange(ex.sheetRow,1,1,4).setValues([row]);
+    else sh.appendRow(row);
+  }
+  return {ok:true,customers:getCustomers_(),personnel:getPersonnel_(),customerMaster:customerMasterRows_()};
+}
+
+
+function ensureUsers_(){
+  let sh=ss_().getSheetByName(FG_CFG.SHEETS.USERS);
+  if(!sh){
+    sh=ss_().insertSheet(FG_CFG.SHEETS.USERS);
+    sh.getRange(1,1,1,4).setValues([['Username','Role','PIN','Status']]);
+    sh.setFrozenRows(1);
+  }
+  if(sh.getLastRow()<2){
+    sh.getRange(2,1,3,4).setValues([
+      ['JPC','ADMIN','1234','ACTIVE'],
+      ['FGW','FG','6789','ACTIVE'],
+      ['PROD','PRODUCTION','0101','ACTIVE']
+    ]);
+  }
+  sh.getRange('C:C').setNumberFormat('@');
+  return sh;
+}
+
+
+/* ==================== V136 USER PERMISSIONS ====================
+   Fixed roles for specific users (always applied, whatever the Users sheet says):
+     JPC  -> ADMIN     : all pages, including Admin / Personnel / User Access
+     CBP  -> MANAGER   : all pages EXCEPT Admin / Personnel / User Access
+     NSF  -> PRESIDENT : all pages EXCEPT Admin / Personnel / User Access
+   Everyone else keeps the role written in the Users sheet (FG, PRODUCTION, ...).
+   To change later, just edit this list.
+=================================================================== */
+const FG_ROLE_OVERRIDES = {
+  JPC: 'ADMIN',
+  CBP: 'MANAGER',
+  NSF: 'PRESIDENT'
+};
+const FG_VALID_ROLES = ['ADMIN','PRESIDENT','MANAGER','FG','PRODUCTION'];
+
+function effectiveRole_(username, sheetRole){
+  return FG_ROLE_OVERRIDES[s_(username).toUpperCase()] || s_(sheetRole).toUpperCase();
+}
+
+// V136: no longer writes to the Users sheet on every page load
+// (and no longer auto-creates a user with a default PIN). Roles come from FG_ROLE_OVERRIDES.
+function ensureManagerUser_(){ return; }
+
+function ensureManagerUserLegacy_(){
+  const sh=sheet_(FG_CFG.SHEETS.USERS);
+
+  // PINs must be stored as text so leading zeroes are preserved.
+  sh.getRange('C:C').setNumberFormat('@');
+
+  const last=sh.getLastRow();
+  const rows=last>=2 ? sh.getRange(2,1,last-1,4).getDisplayValues() : [];
+  let rowNo=0;
+  rows.forEach((r,i)=>{
+    if(s_(r[0]).toUpperCase()==='CBP')rowNo=i+2;
+  });
+
+  if(rowNo){
+    // Preserve whatever PIN the Admin manually sets in Column C.
+    sh.getRange(rowNo,2).setValue('MANAGER');
+    sh.getRange(rowNo,4).setValue('ACTIVE');
+  }else{
+    // Seed only when CBP does not exist yet.
+    sh.getRange(sh.getLastRow()+1,1,1,4)
+      .setNumberFormats([['@','@','@','@']])
+      .setValues([['CBP','MANAGER','0000','ACTIVE']]);
+  }
+}
+
+function getUsers_(){
+  ensureManagerUser_();
+  const sh=ensureUsers_();
+  if(sh.getLastRow()<2)return [];
+  return sh.getRange(2,1,sh.getLastRow()-1,4).getDisplayValues()
+    .map((r,i)=>({
+      sheetRow:i+2,
+      username:s_(r[0]),
+      role:effectiveRole_(r[0],r[1]),
+      status:(s_(r[3])||'ACTIVE').toUpperCase()
+    }))
+    .filter(x=>x.username && x.status==='ACTIVE');
+}
+
+function validateUserPin_(username,pin){
+  const u=s_(username).toUpperCase(), p=s_(pin);
+  if(!u||!p)return {ok:false};
+  const sh=ensureUsers_();
+  if(sh.getLastRow()<2)return {ok:false};
+  const rows=sh.getRange(2,1,sh.getLastRow()-1,4).getDisplayValues();
+  const hit=rows.find(r=>s_(r[0]).toUpperCase()===u && s_(r[2])===p && (s_(r[3])||'ACTIVE').toUpperCase()==='ACTIVE');
+  return hit ? {ok:true,username:s_(hit[0]),role:effectiveRole_(hit[0],hit[1])} : {ok:false};
+}
+
+
+
+function rolePermissions_(role){
+  const r=s_(role).toUpperCase();
+  const all=[
+    'dashboard',
+    'production',
+    'fg_receiving',
+    'metal_detector',
+    'inventory',
+    'allocation',
+    'traceability',
+    'pdr',
+    'personnel',
+    'customers',
+    'admin'
+  ];
+
+  if(r==='ADMIN')return all;
+
+  // MANAGER: full operational access, except Admin / User Management.
+  if(r==='MANAGER' || r==='PRESIDENT')return all.filter(x=>!['admin','personnel'].includes(x));
+
+  if(r==='FG')return [
+    'dashboard',
+    'fg_receiving',
+    'metal_detector',
+    'inventory',
+    'allocation',
+    'traceability',
+    'pdr'
+  ];
+
+  if(r==='PRODUCTION')return [
+    'dashboard',
+    'production',
+    'traceability'
+  ];
+
+  return ['dashboard'];
+}
+
+function getLoginUsers_(){
+  return getUsers_().map(x=>({username:x.username,role:x.role,status:x.status}));
+}
+
+function loginUser_(username,pin){
+  const cache=CacheService.getScriptCache(), fk='FG_FAIL_'+s_(username).toUpperCase();
+  const fails=n_(cache.get(fk));
+  if(fails>=5)throw new Error('Too many wrong PIN attempts for '+s_(username)+'. Please wait 5 minutes.');
+  const auth=validateUserPin_(username,pin);
+  if(!auth.ok){ cache.put(fk,String(fails+1),300); throw new Error('Invalid username or PIN.'); }
+  cache.remove(fk);
+  try{
+    logTxn_({
+      type:'USER LOGIN',
+      ref:'LOGIN',
+      marketType:'',
+      customer:'',
+      item:'',
+      internalCode:'',
+      qtyIn:0,
+      qtyOut:0,
+      user:auth.username,
+      remarks:'Role: '+auth.role
+    });
+  }catch(_){}
+  return {
+    ok:true,
+    username:auth.username,
+    role:auth.role,
+    permissions:rolePermissions_(auth.role)
+  };
+}
+
+function requireAdmin_(username,pin){
+  if(FG_SESSION_ && FG_SESSION_.role==='ADMIN') return {ok:true,username:FG_SESSION_.username,role:'ADMIN'};
+  const auth=validateUserPin_(username,pin);
+  if(!auth.ok || auth.role!=='ADMIN')throw new Error('Admin authorization required.');
+  return auth;
+}
+
+function getAllUsersAdmin_(adminUsername,adminPin){
+  requireAdmin_(adminUsername,adminPin);
+  const sh=ensureUsers_();
+  if(sh.getLastRow()<2)return [];
+  return sh.getRange(2,1,sh.getLastRow()-1,4).getDisplayValues()
+    .map((r,i)=>({
+      sheetRow:i+2,
+      username:s_(r[0]),
+      role:effectiveRole_(r[0],r[1]),
+      status:(s_(r[3])||'ACTIVE').toUpperCase()
+    }))
+    .filter(x=>x.username);
+}
+
+function saveUserAccessCore_(payload,adminUsername,adminPin) {
+  requireAdmin_(adminUsername,adminPin);
+  payload=payload||{};
+  const username=s_(payload.username).toUpperCase();
+  const role=s_(payload.role).toUpperCase();
+  const status=(s_(payload.status)||'ACTIVE').toUpperCase();
+  const newPin=s_(payload.pin);
+  const rowNo=Number(payload.sheetRow)||0;
+
+  if(!username)throw new Error('Username is required.');
+  if(!FG_VALID_ROLES.includes(role))throw new Error('Invalid role.');
+  if(FG_ROLE_OVERRIDES[username] && FG_ROLE_OVERRIDES[username]!==role)
+    throw new Error(username+' is fixed as '+FG_ROLE_OVERRIDES[username]+' in the system settings (FG_ROLE_OVERRIDES).');
+  if(!['ACTIVE','INACTIVE'].includes(status))throw new Error('Invalid status.');
+
+  const sh=ensureUsers_();
+  let pinToSave=newPin;
+
+  if(rowNo>=2 && rowNo<=sh.getLastRow()){
+    const old=sh.getRange(rowNo,1,1,4).getDisplayValues()[0];
+    if(!pinToSave)pinToSave=s_(old[2]);
+    if(!pinToSave)throw new Error('PIN is required.');
+    sh.getRange(rowNo,1,1,4).setValues([[username,role,pinToSave,status]]);
+  }else{
+    if(!pinToSave)throw new Error('PIN is required for a new user.');
+    const vals=sh.getLastRow()<2?[]:sh.getRange(2,1,sh.getLastRow()-1,4).getDisplayValues();
+    const dup=vals.findIndex(r=>s_(r[0]).toUpperCase()===username);
+    if(dup>=0)throw new Error('Username already exists. Edit the existing user instead.');
+    sh.appendRow([username,role,pinToSave,status]);
+  }
+  SpreadsheetApp.flush();
+  return {ok:true,users:getAllUsersAdmin_(adminUsername,adminPin)};
+}
+
+function ensureAllocation_(){
+  let sh=ss_().getSheetByName(FG_CFG.SHEETS.ALLOCATION);
+  if(!sh){
+    sh=ss_().insertSheet(FG_CFG.SHEETS.ALLOCATION);
+    sh.getRange(1,1,1,14).setValues([[
+      'Date','Allocation No.','Market Type','Customer / Destination','Product','Internal Code',
+      'Qty Before','Qty Allocated','Balance','Order Ref','Allocated By','Remarks','Delivery Date','Inventory Row'
+    ]]);
+    sh.setFrozenRows(1);
+  }else{
+    ensureColumns_(sh,14);
+    const headers=[
+      'Date','Allocation No.','Market Type','Customer / Destination','Product','Internal Code',
+      'Qty Before','Qty Allocated','Balance','Order Ref','Allocated By','Remarks','Delivery Date','Inventory Row'
+    ];
+    const current=sh.getRange(1,1,1,14).getDisplayValues()[0];
+    headers.forEach((h,i)=>{if(!s_(current[i]))sh.getRange(1,i+1).setValue(h);});
+  }
+  return sh;
+}
+
+function nextAllocationNo_(){
+  const sh=ensureAllocation_();
+  const y=Utilities.formatDate(new Date(),FG_CFG.TZ,'yyyy');
+  let max=0;
+  if(sh.getLastRow()>=2){
+    sh.getRange(2,2,sh.getLastRow()-1,1).getDisplayValues().flat().forEach(v=>{
+      const m=s_(v).match(/^AL-\d{4}-(\d+)$/i);
+      if(m)max=Math.max(max,Number(m[1])||0);
+    });
+  }
+  return 'AL-'+y+'-'+String(max+1).padStart(4,'0');
+}
+
+function allocationHistory_(){
+  const sh=ensureAllocation_();
+  if(sh.getLastRow()<2)return [];
+  return sh.getRange(2,1,sh.getLastRow()-1,14).getValues().map((r,i)=>({
+    sheetRow:i+2,
+    date:dateText_(r[0]),
+    dateTime:dateTimeText_(r[0]),
+    allocationNo:s_(r[1]),
+    marketType:s_(r[2]),
+    destination:s_(r[3]),
+    product:s_(r[4]),
+    internalCode:s_(r[5]),
+    qtyBefore:n_(r[6]),
+    qtyAllocated:n_(r[7]),
+    balance:n_(r[8]),
+    allocatedBy:s_(r[10]),
+    remarks:s_(r[11]),
+    deliveryDate:dateText_(r[12]),
+    inventoryRow:n_(r[13])
+  })).reverse();
+}
+
+function getAllocationData_(){
+  ensureUsers_();
+  const inv=inventoryRows_().map(x=>({
+    sheetRow:x.sheetRow,
+    marketType:x.marketType,
+    customer:x.customer,
+    item:x.item,
+    internalCode:x.internalCode,
+    qtyOnHand:x.qtyOnHand,
+    unit:'PACK',
+    holdingTimeDays:x.holdingTimeDays,
+    lastValidDate:x.lastValidDate,
+    lapseDate:x.lapseDate,
+    htStatus:x.htStatus,
+    allocatable:x.allocatable
+  })).filter(x=>x.allocatable);
+  return {
+    nextAllocationNo:nextAllocationNo_(),
+    today:today_(),
+    batches:inv,
+    history:allocationHistory_(),
+    customers:getCustomers_(),
+    customerGroups:getCustomerGroups_(),
+    supermarketGroups:getSupermarketGroups_(),
+    users:getUsers_()
+  };
+}
+
+function findInventoryRowForAllocation_(product,internalCode,preferredRow){
+  const sh=sheet_(FG_CFG.SHEETS.INVENTORY);
+  const pr=Number(preferredRow)||0;
+  if(pr>=2 && pr<=sh.getLastRow()){
+    const r=sh.getRange(pr,1,1,10).getValues()[0];
+    if(s_(r[3])===s_(product) && s_(r[4])===s_(internalCode))return pr;
+  }
+  if(sh.getLastRow()<2)return 0;
+  const vals=sh.getRange(2,1,sh.getLastRow()-1,10).getValues();
+  for(let i=0;i<vals.length;i++){
+    if(s_(vals[i][3])===s_(product) && s_(vals[i][4])===s_(internalCode))return i+2;
+  }
+  return 0;
+}
+
+function saveAllocationCore_(payload){
+  payload=payload||{};
+  const editRow=Number(payload.editSheetRow)||0;
+  const qty=n_(payload.qtyAllocated);
+  const market=(s_(payload.marketType)||'INSTITUTIONAL').toUpperCase();
+  const destination=s_(payload.destination);
+  const allocatedBy=s_(payload.allocatedBy);
+
+  if(qty<=0)throw new Error('Enter Qty to Allocate.');
+  if(!destination)throw new Error('Select or enter Customer / Destination.');
+  if(!allocatedBy)throw new Error('Select Allocated By.');
+
+  const requestedProduct=s_(payload.product);
+  if(market==='INSTITUTIONAL' && requestedProduct && !institutionalCustomerHasProduct_(destination,requestedProduct))
+    throw new Error('Allocation blocked. '+destination+' is not assigned to '+requestedProduct+'.');
+  if(market==='SUPERMARKET' && requestedProduct && !supermarketCustomerHasProduct_(destination,requestedProduct))
+    throw new Error('Allocation blocked. '+destination+' is not assigned to '+requestedProduct+' in Supermarket Products.');
+
+  const invSh=sheet_(FG_CFG.SHEETS.INVENTORY);
+  const alSh=ensureAllocation_();
+
+  let invRow=Number(payload.sheetRow)||0;
+  let no=s_(payload.allocationNo)||nextAllocationNo_();
+
+  if(editRow>=2 && editRow<=alSh.getLastRow()){
+    const old=alSh.getRange(editRow,1,1,14).getValues()[0];
+    no=s_(old[1])||no;
+    invRow=findInventoryRowForAllocation_(s_(old[4]),s_(old[5]),n_(old[13])||invRow);
+    if(!invRow)throw new Error('Original inventory batch cannot be found for this allocation.');
+
+    syncHoldingStatuses_();
+    const inv=invSh.getRange(invRow,1,1,16).getValues()[0];
+    const htStatus=s_(inv[13]).toUpperCase();
+    if(!['AVAILABLE','AVAILABLE - QA RELEASED','AVAILABLE - EXTENDED'].includes(htStatus))throw new Error('Allocation blocked. Batch is '+(htStatus||'NOT AVAILABLE')+' under Holding Time control.');
+    const actualProduct=s_(inv[3]);
+    if(market==='INSTITUTIONAL' && !institutionalCustomerHasProduct_(destination,actualProduct))
+      throw new Error('Allocation blocked. '+destination+' is not assigned to '+actualProduct+'.');
+    if(market==='SUPERMARKET' && !supermarketCustomerHasProduct_(destination,actualProduct))
+      throw new Error('Allocation blocked. '+destination+' is not assigned to '+actualProduct+' in Supermarket Products.');
+    const restored=n_(inv[6])+n_(old[7]);
+    if(qty>restored)throw new Error('Allocation exceeds available quantity ('+restored+').');
+
+    const balance=restored-qty;
+    invSh.getRange(invRow,7).setValue(balance);
+    alSh.getRange(editRow,1,1,14).setValues([[
+      new Date(),no,market,destination,s_(inv[3]),s_(inv[4]),
+      restored,qty,balance,'',allocatedBy,s_(payload.remarks),
+      payload.deliveryDate?dateObj_(payload.deliveryDate):'',invRow
+    ]]);
+
+    SpreadsheetApp.flush();
+    return {ok:true,mode:'updated',allocationNo:no,balance:balance,data:getAllocationData_(),dashboard:dashboard_()};
+  }
+
+  if(!invRow || invRow<2)throw new Error('Select an inventory batch.');
+  if(invRow>invSh.getLastRow())throw new Error('Selected inventory batch no longer exists.');
+  // V135: new allocation -> never reuse a number another user already saved.
+  if(valueExistsInColumn_(alSh,2,no)) no=nextAllocationNo_();
+
+  syncHoldingStatuses_();
+  const inv=invSh.getRange(invRow,1,1,16).getValues()[0];
+  const htStatus=s_(inv[13]).toUpperCase();
+  if(!['AVAILABLE','AVAILABLE - QA RELEASED','AVAILABLE - EXTENDED'].includes(htStatus))throw new Error('Allocation blocked. Batch is '+(htStatus||'NOT AVAILABLE')+' under Holding Time control.');
+  const actualProduct=s_(inv[3]);
+  if(market==='INSTITUTIONAL' && !institutionalCustomerHasProduct_(destination,actualProduct))
+    throw new Error('Allocation blocked. '+destination+' is not assigned to '+actualProduct+'.');
+  if(market==='SUPERMARKET' && !supermarketCustomerHasProduct_(destination,actualProduct))
+    throw new Error('Allocation blocked. '+destination+' is not assigned to '+actualProduct+' in Supermarket Products.');
+  const before=n_(inv[6]);
+  if(before<=0)throw new Error('Selected batch has no available quantity.');
+  if(qty>before)throw new Error('Allocation exceeds available batch quantity ('+before+').');
+
+  const balance=before-qty;
+  invSh.getRange(invRow,7).setValue(balance);
+
+  alSh.appendRow([
+    new Date(),no,market,destination,s_(inv[3]),s_(inv[4]),
+    before,qty,balance,'',allocatedBy,s_(payload.remarks),
+    payload.deliveryDate?dateObj_(payload.deliveryDate):'',invRow
+  ]);
+
+  logTxn_({
+    type:'ALLOCATION / TRANSFER',
+    ref:no,
+    marketType:market,
+    customer:destination,
+    item:s_(inv[3]),
+    internalCode:s_(inv[4]),
+    qtyIn:0,
+    qtyOut:qty,
+    user:allocatedBy,
+    remarks:s_(payload.remarks)
+  });
+
+  SpreadsheetApp.flush();
+  return {ok:true,mode:'saved',allocationNo:no,balance:balance,data:getAllocationData_(),dashboard:dashboard_()};
+}
+function saveAllocation_(payload){return withWriteLock_(function(){return saveAllocationCore_(payload);});}
+
+function getProducts_() {
+  const out = [], seen = {};
+  rows_(FG_CFG.SHEETS.PRODUCTS).forEach(r => {
+    const item = s_(r[1]);
+    if (!item || s_(r[7]).toUpperCase() === 'NO') return;
+    const k = item.toUpperCase();
+    if (seen[k]) return;
+    seen[k] = true;
+    out.push({
+      item:item,
+      marketType:s_(r[2]),
+      category:s_(r[3]),
+      unit:'PACK',
+      shelfLifeDays:n_(r[5]),
+      productionArea:s_(r[6])
+    });
+  });
+  rows_(FG_CFG.SHEETS.CUSTOMER_PRODUCTS).forEach(r => {
+    const item = s_(r[1]);
+    if (!item || s_(r[3]).toUpperCase() === 'NO') return;
+    const k = item.toUpperCase();
+    if (seen[k]) return;
+    seen[k] = true;
+    out.push({item:item,marketType:'INSTITUTIONAL',category:'CUSTOMER PRODUCT',unit:'PACK',shelfLifeDays:0,productionArea:''});
+  });
+  return out.sort((a,b)=>a.item.localeCompare(b.item));
+}
+
+function getCustomers_() {
+  const set = {};
+  rows_(FG_CFG.SHEETS.CUSTOMER_PRODUCTS).forEach(r => {
+    const c = s_(r[0]);
+    if (c && s_(r[3]).toUpperCase() !== 'NO') set[c] = true;
+  });
+  customerMasterRows_().forEach(x=>{
+    if(x.customer && x.status!=='INACTIVE')set[x.customer]=true;
+  });
+  getSupermarketGroups_().forEach(g=>{if(g.customer)set[g.customer]=true;});
+  return Object.keys(set).sort();
+}
+
+function getCustomerGroups_() {
+  const map = {};
+  rows_(FG_CFG.SHEETS.CUSTOMER_PRODUCTS).forEach(r => {
+    const c=s_(r[0]), item=s_(r[1]), active=s_(r[3]).toUpperCase();
+    if (!c || !item || active === 'NO') return;
+    if (!map[c]) map[c] = [];
+    if (!map[c].some(x=>x.toUpperCase()===item.toUpperCase())) map[c].push(item);
+  });
+  return Object.keys(map).sort().map(c=>({customer:c,products:map[c].sort()}));
+}
+
+function getSupermarketGroups_() {
+  const sh=ss_().getSheetByName(FG_CFG.SHEETS.SUPERMARKET_PRODUCTS);
+  if(!sh || sh.getLastRow()<2)return [];
+  const map={};
+  sh.getRange(2,1,sh.getLastRow()-1,Math.max(3,sh.getLastColumn())).getValues().forEach(r=>{
+    const customer=s_(r[0]), product=s_(r[1]), status=s_(r[2]).toUpperCase();
+    if(!customer || !product)return;
+    if(status && status!=='ACTIVE' && status!=='YES')return;
+    if(!map[customer])map[customer]=[];
+    if(!map[customer].some(x=>x.toUpperCase()===product.toUpperCase()))map[customer].push(product);
+  });
+  return Object.keys(map).sort().map(customer=>({customer:customer,products:map[customer].sort()}));
+}
+
+function getSupermarketProducts_() {
+  const seen={}, out=[];
+  getSupermarketGroups_().forEach(g=>(g.products||[]).forEach(p=>{
+    const k=s_(p).toUpperCase();
+    if(k&&!seen[k]){seen[k]=1;out.push(p);}
+  }));
+  return out.sort();
+}
+
+function supermarketCustomerHasProduct_(customer,product){
+  const c=s_(customer).toUpperCase(), p=s_(product).toUpperCase();
+  if(!c||!p)return false;
+  return getSupermarketGroups_().some(g=>
+    s_(g.customer).toUpperCase()===c &&
+    (g.products||[]).some(x=>s_(x).toUpperCase()===p)
+  );
+}
+
+function transferRows_() {
+  const sh = sheet_(FG_CFG.SHEETS.TRANSMITTAL);
+  if (sh.getLastRow() < 2) return [];
+  ensureColumns_(sh,15);
+  return sh.getRange(2,1,sh.getLastRow()-1,15).getValues();
+}
+
+function pendingTransfers_() {
+  const map = {};
+  transferRows_().forEach((r,i) => {
+    if (s_(r[10]).toUpperCase() !== 'PENDING') return;
+    const no=s_(r[1]);
+    if (!no) return;
+    if (!map[no]) map[no]={
+      transmittalNo:no,
+      date:dateText_(r[0]),
+      from:s_(r[2]) || 'PRODUCTION',
+      transferredBy:s_(r[8]),
+      lines:[]
+    };
+    map[no].lines.push({
+      sheetRow:i+2,
+      item:s_(r[3]),
+      internalCode:s_(r[4]),
+      qtyTransferred:n_(r[5]),
+      unit:s_(r[6]) || 'PACK',
+      productionDate:dateText_(r[7]),
+      remarks:s_(r[11]),
+      marketType:s_(r[12]) || productInfo_(r[3]).marketType,
+      customer:s_(r[13]),
+      returnRef:s_(r[14])          // V140: set when this line is a re-transmit after an FG return
+    });
+  });
+  return Object.values(map).sort((a,b)=>String(b.transmittalNo).localeCompare(String(a.transmittalNo)));
+}
+
+function savedTransfers_() {
+  const map={};
+  transferRows_().forEach(r=>{
+    const no=s_(r[1]);
+    if(!no)return;
+    if(!map[no])map[no]={transmittalNo:no,date:dateText_(r[0]),dateTime:dateTimeText_(r[0]),status:'',lineCount:0,transferredBy:s_(r[8])};
+    map[no].lineCount++;
+    const st=s_(r[10]).toUpperCase();
+    if(st==='PENDING')map[no].status='PENDING';
+    else if(!map[no].status)map[no].status=st || 'RECEIVED';
+  });
+  return Object.values(map).sort((a,b)=>String(b.transmittalNo).localeCompare(String(a.transmittalNo)));
+}
+
+function receivedTransfers_() {
+  ensureReceiving_();
+  const sh=sheet_(FG_CFG.SHEETS.RECEIVING);
+  if(sh.getLastRow()<2)return [];
+  const map={};
+  sh.getRange(2,1,sh.getLastRow()-1,13).getValues().forEach(r=>{
+    const no=s_(r[1]);
+    if(!no)return;
+    if(!map[no])map[no]={transmittalNo:no,receiptDate:dateText_(r[0]),receiptDateTime:dateTimeText_(r[0]),receivedBy:s_(r[10]),lineCount:0};
+    map[no].lineCount++;
+  });
+  return Object.values(map).sort((a,b)=>String(b.transmittalNo).localeCompare(String(a.transmittalNo)));
+}
+
+// V137: read-only requests (dashboard, page loads) read + sync Inventory only ONCE per request.
+var FG_INV_CACHE_ = null;
+function inventoryRows_() {
+  if (!hasWriteLock_() && FG_INV_CACHE_) return FG_INV_CACHE_.slice();
+  const out = inventoryRowsRaw_();
+  if (!hasWriteLock_()) FG_INV_CACHE_ = out;
+  return out.slice();
+}
+
+function inventoryRowsRaw_() {
+  syncHoldingStatuses_();
+  const sh=sheet_(FG_CFG.SHEETS.INVENTORY);
+  if(sh.getLastRow()<2)return [];
+  return sh.getRange(2,1,sh.getLastRow()-1,Math.max(17,sh.getLastColumn())).getValues().map((r,i)=>({
+    sheetRow:i+2,
+    inventoryDate:dateText_(r[0]),
+    marketType:s_(r[1]),
+    customer:s_(r[2]),
+    item:s_(r[3]),
+    internalCode:s_(r[4]),
+    productionDate:dateText_(r[5]),
+    qtyOnHand:n_(r[6]),
+    expiryDate:dateText_(r[7]),
+    agingDays:n_(r[8]),
+    remarks:s_(r[9]),
+    unit:'PACK',
+    holdingTimeDays:n_(r[10]),
+    lastValidDate:dateText_(r[11]),
+    lapseDate:dateText_(r[12]),
+    htStatus:s_(r[13])||'NO HT SET',
+    qualityDecision:s_(r[14]),
+    qualityRemarks:s_(r[15]),
+    qualityDecisionDateTime:dateTimeText_(r[16]),
+    allocatable:n_(r[6])>0 && ['AVAILABLE','AVAILABLE - QA RELEASED','AVAILABLE - EXTENDED'].includes(s_(r[13]).toUpperCase())
+  })).filter(x=>x.item && x.qtyOnHand>0);
+}
+
+function dashboard_() {
+  const inv=inventoryRows_();
+  const today=today_();
+  let total=0,availableInventory=0,lapsedInventory=0,receivedToday=0;
+  const items={};
+  inv.forEach(x=>{total+=x.qtyOnHand;if(x.htStatus==='AVAILABLE')availableInventory+=x.qtyOnHand;if(x.htStatus==='LAPSED')lapsedInventory+=x.qtyOnHand;items[x.item.toUpperCase()]=1;});
+  ensureReceiving_();
+  const sh=sheet_(FG_CFG.SHEETS.RECEIVING);
+  if(sh.getLastRow()>=2){
+    sh.getRange(2,1,sh.getLastRow()-1,13).getValues().forEach(r=>{
+      if(dateText_(r[0])===today && s_(r[9]).toUpperCase()!=='REJECTED')receivedToday+=n_(r[6]);
+    });
+  }
+  const pending=pendingTransfers_();
+  return {
+    totalInventory:total,
+    availableInventory:availableInventory,
+    lapsedInventory:lapsedInventory,
+    uniqueItems:Object.keys(items).length,
+    receivedToday:receivedToday,
+    pendingTransmittals:pending.length,
+    inventoryRows:inv.length,
+    tasks:actionItems_(inv,pending)     // V141: what needs doing, per user access
+  };
+}
+
+/* ==================== V141 ACTION ITEMS (dashboard + notification bell) ====================
+   Each group only appears for users whose role can act on it:
+     Pending FG Receiving     -> fgreceiving
+     Pending Metal Detection  -> metal
+     Pending PDR              -> pdr        (open PDRs + rejected FG returns waiting for a PDR)
+     Lapsed Products          -> inventory  (roles that can decide on inventory; not PRODUCTION)
+     Returned from FG         -> transmittal (Production action needed)
+   Every item has a stable id so the bell can tell new items from ones already seen.
+============================================================================================ */
+function actionItems_(inv, pending){
+  const role = FG_SESSION_ ? FG_SESSION_.role : 'ADMIN';
+  const pages = FG_PAGE_ACCESS[role] || [];
+  const can = p => pages.indexOf(p) >= 0;
+  const out = {};
+  const cap = a => a.slice(0,60);
+
+  if(can('fgreceiving')){
+    const items = (pending||pendingTransfers_()).map(t=>({
+      id:'TR:'+t.transmittalNo+':'+(t.lines||[]).map(l=>l.sheetRow).join('.'),
+      title:t.transmittalNo+((t.lines||[]).some(l=>l.returnRef)?' (RE-TRANSMIT)':''),
+      sub:(t.lines||[]).length+' item(s) · by '+(t.transferredBy||'-')+' · '+(t.date||''), page:'fgreceiving', ref:{tr:t.transmittalNo}}));
+    out.fgReceiving = {label:'Pending FG Receiving', page:'fgreceiving', count:items.length, items:cap(items)};
+  }
+  if(can('metal')){
+    const q = getMetalDetectionQueue_();
+    const items = q.map(x=>({id:'MD:'+x.receivingRow, title:x.product+' · '+x.internalCode,
+      sub:x.transferNo+' · '+x.qtyReceived+' '+(x.unit||'PACK')+' received '+(x.receiptDate||''), page:'metal', ref:{tr:x.transferNo, row:x.receivingRow}}));
+    out.metal = {label:'Pending Metal Detection', page:'metal', count:items.length, items:cap(items)};
+  }
+  if(can('pdr')){
+    const open = pdrRows_().filter(x=>['CLOSED','COMPLETED','DONE','CANCELLED'].indexOf(s_(x.status).toUpperCase())<0)
+      .map(x=>({id:'PDR:'+x.pdrNo, title:x.pdrNo+' · '+x.product, sub:(x.status||'OPEN')+' · '+(x.concern||''), page:'pdr', ref:{pdrNo:x.pdrNo}}));
+    const waiting = fgReturnRows_().filter(x=>x.status==='REJECTED - FOR PDR' && !x.link)
+      .map(x=>({id:'RTPDR:'+x.returnNo, title:'Create PDR: '+x.product, sub:x.returnNo+' / '+x.transmittalNo+' · '+x.qty+' '+x.unit+' rejected', page:'pdr',
+        ref:{newPdr:{referenceNo:x.returnNo+' / '+x.transmittalNo, product:x.product, internalCode:x.internalCode, qty:x.qty,
+             concern:'Rejected at FG Receiving: '+x.fgReason, area:'FG RECEIVING', remarks:x.actionRemarks, returnNo:x.returnNo, tr:x.transmittalNo}}}));
+    const items = waiting.concat(open);
+    out.pdr = {label:'Pending PDR', page:'pdr', count:items.length, items:cap(items)};
+  }
+  if(can('inventory') && FG_INVENTORY_EDIT_ROLES.indexOf(role)>=0){
+    const items = (inv||inventoryRows_()).filter(x=>x.htStatus==='LAPSED' && x.qtyOnHand>0)
+      .map(x=>({id:'LAPSE:'+x.sheetRow+':'+x.internalCode, title:x.item+' · '+x.internalCode,
+        sub:x.qtyOnHand+' PACK · lapsed '+(x.lapseDate||''), page:'inventory', ref:{search:x.internalCode, item:x.item}}));
+    out.lapsed = {label:'Lapsed Products', page:'inventory', count:items.length, items:cap(items)};
+  }
+  if(can('transmittal')){
+    const items = fgReturnRows_().filter(x=>x.status==='FOR PRODUCTION ACTION')
+      .map(x=>({id:'RT:'+x.returnNo, title:x.returnNo+' · '+x.product, sub:x.transmittalNo+' · '+x.qty+' '+x.unit+' · '+x.fgReason, page:'transmittal', ref:{returnNo:x.returnNo}}));
+    out.returns = {label:'Returned from FG Receiving', page:'transmittal', count:items.length, items:cap(items)};
+  }
+  return out;
+}
+
+
+function reallocationSheet_(){
+  const ss=SpreadsheetApp.getActive();
+  let sh=ss.getSheetByName('Reallocation');
+  if(!sh)sh=ss.insertSheet('Reallocation');
+  const h=['Date','Reallocation No.','From Allocation No.','Market Type','From Customer / Destination','To Customer / Destination','Product','Internal Code','Qty Reallocated','Reallocated By','Reason / Remarks','Original Allocation Row'];
+  ensureColumns_(sh,h.length);
+  if(sh.getLastRow()===0)sh.appendRow(h);
+  else sh.getRange(1,1,1,h.length).setValues([h]);
+  return sh;
+}
+function nextReallocationNo_(){
+  const sh=reallocationSheet_(), y=new Date().getFullYear();
+  let max=0;
+  if(sh.getLastRow()>1)sh.getRange(2,2,sh.getLastRow()-1,1).getValues().forEach(r=>{
+    const m=s_(r[0]).match(new RegExp('^RA-'+y+'-(\\d+)$')); if(m)max=Math.max(max,Number(m[1]));
+  });
+  return 'RA-'+y+'-'+String(max+1).padStart(4,'0');
+}
+function getReallocationHistory_(){
+  const sh=reallocationSheet_();
+  if(sh.getLastRow()<2)return [];
+  return sh.getRange(2,1,sh.getLastRow()-1,12).getValues().map((r,i)=>({
+    sheetRow:i+2,date:dateText_(r[0]),dateTime:dateTimeText_(r[0]),reallocationNo:s_(r[1]),fromAllocationNo:s_(r[2]),marketType:s_(r[3]),
+    fromCustomer:s_(r[4]),toCustomer:s_(r[5]),product:s_(r[6]),internalCode:s_(r[7]),qty:n_(r[8]),
+    reallocatedBy:s_(r[9]),remarks:s_(r[10]),originalAllocationRow:n_(r[11])
+  })).filter(x=>x.reallocationNo).reverse();
+}
+
+function institutionalCustomerHasProduct_(customer,product){
+  const sh=ss_().getSheetByName(FG_CFG.SHEETS.CUSTOMER_PRODUCTS);
+  if(!sh || sh.getLastRow()<2)return false;
+  const c=s_(customer).toUpperCase(), p=s_(product).toUpperCase();
+  if(!c||!p)return false;
+  return sh.getRange(2,1,sh.getLastRow()-1,Math.max(4,sh.getLastColumn())).getValues().some(r=>{
+    const active=s_(r[3]).toUpperCase();
+    return s_(r[0]).toUpperCase()===c &&
+           s_(r[1]).toUpperCase()===p &&
+           (!active || active==='ACTIVE' || active==='YES');
+  });
+}
+
+function saveReallocationCore_(payload){
+  payload=payload||{};
+  const allocationRow=n_(payload.allocationRow), qty=n_(payload.qty);
+  const toCustomer=s_(payload.toCustomer), by=s_(payload.reallocatedBy), remarks=s_(payload.remarks);
+  if(allocationRow<2)throw new Error('Select an allocation record to reallocate.');
+  if(qty<=0)throw new Error('Qty to Reallocate must be greater than zero.');
+  if(!toCustomer)throw new Error('New Customer / Destination is required.');
+  if(!by)throw new Error('Reallocated By is required.');
+  if(!remarks)throw new Error('Reason / Remarks is required for reallocation.');
+
+  const sh=sheet_(FG_CFG.SHEETS.ALLOCATION);
+  ensureColumns_(sh,14);
+  if(allocationRow>sh.getLastRow())throw new Error('Original allocation record was not found.');
+  const r=sh.getRange(allocationRow,1,1,14).getValues()[0];
+  const currentQty=n_(r[7]);
+  if(qty>currentQty)throw new Error('Qty to Reallocate cannot exceed the current allocated quantity ('+currentQty+').');
+  const fromCustomer=s_(r[3]), product=s_(r[4]), code=s_(r[5]), market=s_(r[2]);
+  if(toCustomer.toUpperCase()===fromCustomer.toUpperCase())throw new Error('New destination must be different from the current destination.');
+
+  if(market.toUpperCase()==='INSTITUTIONAL'){
+    if(!institutionalCustomerHasProduct_(toCustomer,product)){
+      throw new Error('Reallocation blocked. '+toCustomer+' is not assigned to product '+product+' in Customer Products.');
+    }
+  }
+  if(market.toUpperCase()==='SUPERMARKET'){
+    if(!supermarketCustomerHasProduct_(toCustomer,product)){
+      throw new Error('Reallocation blocked. '+toCustomer+' is not assigned to product '+product+' in Supermarket Products.');
+    }
+  }
+
+  // Reallocation is allocation-to-allocation: inventory balance is not changed.
+  const remaining=currentQty-qty;
+  r[7]=remaining;
+  r[8]=n_(r[6])-remaining;
+  sh.getRange(allocationRow,1,1,14).setValues([r]);
+
+  const newNo=nextAllocationNo_();
+  const newRow=[
+    new Date(),newNo,market,toCustomer,product,code,n_(r[6]),qty,n_(r[6])-qty,'',by,
+    'REALLOCATED FROM '+s_(r[1])+(remarks?' - '+remarks:''),s_(r[12]),n_(r[13])
+  ];
+  sh.appendRow(newRow);
+
+  const raNo=nextReallocationNo_();
+  reallocationSheet_().appendRow([new Date(),raNo,s_(r[1]),market,fromCustomer,toCustomer,product,code,qty,by,remarks,allocationRow]);
+  return {ok:true,reallocationNo:raNo,newAllocationNo:newNo,remainingQty:remaining};
+}
+function saveReallocation_(payload){return withWriteLock_(function(){return saveReallocationCore_(payload);});}
+
+function getAppBootstrapData_(){
+  return {
+    version:FG_APP_VERSION,
+    today:today_(),
+    nextTransferNo:nextTransferNo_(),
+    nextMetalIncidentNo:getNextMetalMonitoringNo_()
+  };
+}
+
+function getAppData_() {
+  ensureReceiving_();
+  metalSheet_();
+  ensureMetalMonitoring_();
+  return {
+    version:FG_APP_VERSION,
+    today:today_(),
+    julian:getJulianCode_(today_()),
+    nextTransferNo:nextTransferNo_(),
+    nextMetalIncidentNo:getNextMetalMonitoringNo_(),
+    products:getProducts_(),
+    customers:getCustomers_(),
+    personnel:getPersonnel_(),
+    customerMaster:customerMasterRows_(),
+    customerGroups:getCustomerGroups_(),
+    supermarketGroups:getSupermarketGroups_(),
+    supermarketProducts:getSupermarketProducts_(),
+    pendingTransfers:pendingTransfers_(),
+    savedTransfers:savedTransfers_(),
+    receivedTransfers:receivedTransfers_(),
+    metalQueue:getMetalDetectionQueue_(),
+    dashboard:dashboard_(),
+    users:getUsers_(),
+    fgReturns:listFgReturns_()
+  };
+}
+
+function saveTransferCore_(payload) {
+  payload=payload||{};
+  const lines=Array.isArray(payload.lines)?payload.lines:[];
+  if(!lines.length)throw new Error('Add at least one item.');
+  const transferredBy=s_(payload.transferredBy);
+  if(!transferredBy)throw new Error('Transferred By is required.');
+
+  const date=payload.date||today_();
+  const saveStamp=new Date();
+  const sh=sheet_(FG_CFG.SHEETS.TRANSMITTAL);
+  ensureColumns_(sh,14);
+  // V135: the number shown on screen may already have been used by another user.
+  let no=s_(payload.transmittalNo);
+  if(!no || valueExistsInColumn_(sh,2,no)) no=nextTransferNo_();
+
+  const out=lines.map((line,idx)=>{
+    const item=s_(line.item);
+    const code=s_(line.internalCode);
+    const qty=n_(line.qtyTransferred);
+    const type=s_(line.marketType).toUpperCase();
+    const customer=s_(line.customer);
+    if(!item)throw new Error('Item is required on line '+(idx+1)+'.');
+    if(!code)throw new Error('Internal Code is required for '+item+'.');
+    if(qty<=0)throw new Error('Transferred quantity must be greater than zero for '+item+'.');
+    if(type==='INSTITUTIONAL' && !customer)throw new Error('Institutional Customer is required for '+item+'.');
+    if(type==='SUPERMARKET' && !customer)throw new Error('Supermarket Customer is required for '+item+'.');
+    if(type==='INSTITUTIONAL' && !institutionalCustomerHasProduct_(customer,item))
+      throw new Error(customer+' is not assigned to product '+item+' in Customer Products.');
+    if(type==='SUPERMARKET' && !supermarketCustomerHasProduct_(customer,item))
+      throw new Error(customer+' is not assigned to product '+item+' in Supermarket Products.');
+    const info=productInfo_(item);
+    return [
+      saveStamp,
+      no,
+      s_(payload.from)||'PRODUCTION',
+      item,
+      code,
+      qty,
+      s_(line.unit)||info.unit||'PACK',
+      dateObj_(line.productionDate||date),
+      transferredBy,
+      '',
+      'PENDING',
+      s_(line.remarks),
+      type || s_(info.marketType).toUpperCase(),
+      customer
+    ];
+  });
+
+  sh.getRange(sh.getLastRow()+1,1,out.length,14).setValues(out);
+  SpreadsheetApp.flush();
+
+  return {
+    ok:true,
+    transmittalNo:no,
+    nextTransferNo:nextTransferNo_(),
+    pendingTransfers:pendingTransfers_(),
+    savedTransfers:savedTransfers_(),
+    dashboard:dashboard_()
+  };
+}
+
+function addInventory_(receiptDate,tr,qty) {
+  const sh=sheet_(FG_CFG.SHEETS.INVENTORY);
+  ensureColumns_(sh,10);
+  const item=s_(tr[3]), code=s_(tr[4]);
+  const type=s_(tr[12]) || productInfo_(item).marketType;
+  const customer=s_(tr[13]);
+  const prodDate=tr[7] instanceof Date ? tr[7] : dateObj_(dateText_(tr[7])||receiptDate);
+  const shelf=productInfo_(item).shelfLifeDays;
+  const expiry=shelf>0 ? new Date(prodDate.getTime()+shelf*86400000) : '';
+
+  const data=sh.getLastRow()<2?[]:sh.getRange(2,1,sh.getLastRow()-1,10).getValues();
+  for(let i=0;i<data.length;i++){
+    if(s_(data[i][3]).toUpperCase()===item.toUpperCase() && s_(data[i][4]).toUpperCase()===code.toUpperCase()){
+      const row=i+2;
+      sh.getRange(row,1).setValue(dateObj_(receiptDate));
+      sh.getRange(row,2).setValue(type);
+      sh.getRange(row,3).setValue(customer);
+      sh.getRange(row,7).setValue(n_(data[i][6])+qty);
+      if(expiry)sh.getRange(row,8).setValue(expiry);
+      sh.getRange(row,9).setFormula('=IF(F'+row+'="","",TODAY()-F'+row+')');
+      return;
+    }
+  }
+
+  const row=sh.getLastRow()+1;
+  sh.appendRow([dateObj_(receiptDate),type,customer,item,code,prodDate,qty,expiry,'','']);
+  sh.getRange(row,9).setFormula('=IF(F'+row+'="","",TODAY()-F'+row+')');
+}
+
+function batchBalance_(item,code) {
+  const keyItem=s_(item).toUpperCase(), keyCode=s_(code).toUpperCase();
+  const found=inventoryRows_().find(x=>x.item.toUpperCase()===keyItem && x.internalCode.toUpperCase()===keyCode);
+  return found?found.qtyOnHand:0;
+}
+
+function logTxn_(t) {
+  const sh=sheet_(FG_CFG.SHEETS.TRANSACTIONS);
+  ensureColumns_(sh,12);
+  sh.appendRow([
+    new Date(),
+    s_(t.type),
+    s_(t.ref),
+    s_(t.marketType),
+    s_(t.customer),
+    s_(t.item),
+    s_(t.internalCode),
+    n_(t.qtyIn),
+    n_(t.qtyOut),
+    batchBalance_(t.item,t.internalCode),
+    s_(t.user),
+    s_(t.remarks)
+  ]);
+}
+
+function receiveTransferCore_(payload) {
+  payload=payload||{};
+  const no=s_(payload.transmittalNo);
+  const lines=Array.isArray(payload.lines)?payload.lines:[];
+  const receivedBy=s_(payload.receivedBy);
+  const notedBy=s_(payload.notedBy);
+  const receiptDate=payload.receiptDate||today_();
+  const receiveStamp=new Date();
+
+  if(!no||!lines.length)throw new Error('Select a pending transfer.');
+  if(!receivedBy)throw new Error('Received By is required.');
+
+  const transSh=sheet_(FG_CFG.SHEETS.TRANSMITTAL);
+  const recvSh=sheet_(FG_CFG.SHEETS.RECEIVING);
+  ensureReceiving_();
+  ensureColumns_(transSh,15);
+  ensureColumns_(recvSh,14);
+  if(!s_(recvSh.getRange(1,14).getValue())) recvSh.getRange(1,14).setValue('Transmittal Row');
+
+  const recvRows=[], returnsMade=[];
+  lines.forEach((line,idx)=>{
+    const rowNo=Number(line.sheetRow);
+    if(!rowNo||rowNo<2)throw new Error('Invalid transfer line '+(idx+1)+'.');
+    const tr=transSh.getRange(rowNo,1,1,15).getValues()[0];
+    if(s_(tr[1])!==no)throw new Error('Transfer reference mismatch.');
+    if(s_(tr[10]).toUpperCase()!=='PENDING')throw new Error(s_(tr[3])+' is no longer pending.');
+
+    const tx=n_(tr[5]), rx=n_(line.qtyReceived);
+    if(rx<0||rx>tx)throw new Error('Invalid received quantity for '+s_(tr[3])+'.');
+    // V140: any rejected quantity goes back to Production and needs a reason.
+    if(rx<tx && !s_(line.remarks))
+      throw new Error('Enter the reject reason in Remarks for '+s_(tr[3])+' ('+(tx-rx)+' of '+tx+' rejected).');
+
+    const status=rx<=0?'REJECTED':'FOR METAL DETECTION';
+    recvRows.push([
+      receiveStamp, no, s_(tr[2]), s_(tr[3]), s_(tr[4]),
+      tx, rx, s_(tr[6]), 'PENDING', status, receivedBy, s_(line.remarks), notedBy, rowNo
+    ]);
+
+    transSh.getRange(rowNo,10).setValue(receivedBy);
+    transSh.getRange(rowNo,11).setValue(rx<=0?'RETURNED TO PRODUCTION':'RECEIVED');
+    if(rx<tx) returnsMade.push(createFgReturn_(no,rowNo,tr,tx-rx,s_(line.remarks),receivedBy,receiveStamp));
+  });
+
+  recvSh.getRange(recvSh.getLastRow()+1,1,recvRows.length,14).setValues(recvRows);
+  SpreadsheetApp.flush();
+
+  return {
+    ok:true,
+    returnsMade:returnsMade,
+    fgReturns:listFgReturns_(),
+    transmittalNo:no,
+    pendingTransfers:pendingTransfers_(),
+    receivedTransfers:receivedTransfers_(),
+    metalQueue:getMetalDetectionQueue_(),
+    dashboard:dashboard_()
+  };
+}
+
+
+function saveLapsedQADecisionCore_(payload) {
+  payload=payload||{};
+  const row=n_(payload.inventoryRow);
+  const decision=s_(payload.decision).toUpperCase();
+  const remarks=s_(payload.remarks);
+  const extendedUntil=s_(payload.extendedUntil);
+  if(!row)throw new Error('Inventory row is required.');
+  if(!['RELEASE','EXTEND HOLD','PDR'].includes(decision))throw new Error('Invalid QA Decision.');
+
+  syncHoldingStatuses_();
+  const sh=sheet_(FG_CFG.SHEETS.INVENTORY);
+  const r=sh.getRange(row,1,1,16).getValues()[0];
+  const item=s_(r[3]), internalCode=s_(r[4]), qty=n_(r[6]), status=s_(r[13]).toUpperCase();
+  if(qty<=0)throw new Error('This batch has no remaining inventory.');
+  if(!status.startsWith('LAPSED'))throw new Error('QA Decision is only available for LAPSED inventory.');
+
+  let qRemarks=remarks;
+  if(decision==='EXTEND HOLD'){
+    if(!extendedUntil)throw new Error('New valid-through date is required for EXTEND HOLD.');
+    const d=dateObj_(extendedUntil); d.setHours(0,0,0,0);
+    const today=dateObj_(today_()); today.setHours(0,0,0,0);
+    if(d<today)throw new Error('Extended valid-through date cannot be earlier than today.');
+    qRemarks='EXTENDED UNTIL: '+Utilities.formatDate(d,FG_CFG.TZ,'yyyy-MM-dd')+(remarks?' | '+remarks:'');
+  }
+
+  sh.getRange(row,15).setValue(decision);
+  sh.getRange(row,16).setValue(qRemarks);
+  sh.getRange(row,17).setValue(new Date());
+  syncHoldingStatuses_();
+
+  logTxn_({
+    type:'QA HOLDING TIME DECISION',ref:'INV-ROW-'+row,marketType:s_(r[1]),customer:s_(r[2]),
+    item:item,internalCode:internalCode,qtyIn:0,qtyOut:0,user:s_(payload.decidedBy),
+    remarks:'Decision: '+decision+(qRemarks?' | '+qRemarks:'')
+  });
+
+  if(decision==='PDR'){
+    return {
+      ok:true,openPDR:true,inventoryRow:row,product:item,internalCode:internalCode,qty:qty,
+      productionDate:dateText_(r[5]),holdingTimeDays:n_(r[10]),
+      lastValidDate:dateText_(r[11]),lapseDate:dateText_(r[12]),
+      concern:'Holding Time Exceeded',
+      remarks:qRemarks||'Holding Time exceeded. For Product Disposition Report.'
+    };
+  }
+  return {ok:true,openPDR:false,decision:decision};
+}
+
+function getInventoryData_(filters) {
+  filters=filters||{};
+  const market=s_(filters.marketType).toUpperCase();
+  const search=s_(filters.search).toUpperCase();
+  const raw=inventoryRows_().filter(x=>
+    (!market||x.marketType.toUpperCase()===market) &&
+    (!search||x.item.toUpperCase().includes(search)||x.internalCode.toUpperCase().includes(search)||x.customer.toUpperCase().includes(search))
+  );
+
+  const codeSet={}, map={};
+  raw.forEach(x=>{
+    codeSet[x.internalCode]=1;
+    const key=x.item+'||'+x.marketType+'||'+x.customer;
+    if(!map[key])map[key]={item:x.item,marketType:x.marketType,customer:x.customer,codes:{},total:0};
+    map[key].codes[x.internalCode]=(map[key].codes[x.internalCode]||0)+x.qtyOnHand;
+    map[key].total+=x.qtyOnHand;
+  });
+
+  const codes=Object.keys(codeSet).sort((a,b)=>{
+    const na=parseInt(a,10),nb=parseInt(b,10);
+    if(isFinite(na)&&isFinite(nb)&&na!==nb)return na-nb;
+    return a.localeCompare(b);
+  });
+  const availableQty=raw.filter(x=>x.htStatus==='AVAILABLE').reduce((a,x)=>a+x.qtyOnHand,0);
+  const lapsedQty=raw.filter(x=>x.htStatus==='LAPSED').reduce((a,x)=>a+x.qtyOnHand,0);
+  return {codes:codes,rows:Object.values(map).sort((a,b)=>a.item.localeCompare(b.item)),raw:raw,availableQty,lapsedQty};
+}
+
+function getTransactions_(limit) {
+  const sh=sheet_(FG_CFG.SHEETS.TRANSACTIONS);
+  if(sh.getLastRow()<2)return [];
+  // V137: read only the newest rows instead of the whole sheet.
+  const want=Number(limit)||200, last=sh.getLastRow();
+  const start=Math.max(2,last-want+1);
+  return sh.getRange(start,1,last-start+1,Math.max(12,sh.getLastColumn())).getValues()
+    .slice().reverse().slice(0,want).map(r=>({
+      timestamp:r[0] instanceof Date?dateTimeText_(r[0]):s_(r[0]),
+      type:s_(r[1]),ref:s_(r[2]),marketType:s_(r[3]),customer:s_(r[4]),
+      item:s_(r[5]),internalCode:s_(r[6]),qtyIn:n_(r[7]),qtyOut:n_(r[8]),
+      balance:n_(r[9]),user:s_(r[10]),remarks:s_(r[11])
+    }));
+}
+
+
+function institutionalInventoryProducts_(){
+  const map={};
+  inventoryRows_().forEach(x=>{
+    const item=s_(x.item);
+    if(item)map[item.toUpperCase()]=item;
+  });
+  return Object.values(map).sort((a,b)=>a.localeCompare(b));
+}
+
+function getInstitutionalCustomerEditorData_(){
+  const customerMap={};
+
+  customerMasterRows_().forEach(x=>{
+    if(x.marketType==='INSTITUTIONAL'){
+      customerMap[x.customer.toUpperCase()]={
+        sheetRow:x.sheetRow,
+        customer:x.customer,
+        status:x.status,
+        products:[]
+      };
+    }
+  });
+
+  rows_(FG_CFG.SHEETS.CUSTOMER_PRODUCTS).forEach(r=>{
+    const customer=s_(r[0]), product=s_(r[1]), active=(s_(r[3])||'YES').toUpperCase();
+    if(!customer || !product || active==='NO')return;
+    const key=customer.toUpperCase();
+    if(!customerMap[key]){
+      customerMap[key]={sheetRow:0,customer:customer,status:'ACTIVE',products:[]};
+    }
+    if(!customerMap[key].products.some(p=>p.toUpperCase()===product.toUpperCase())){
+      customerMap[key].products.push(product);
+    }
+  });
+
+  const customers=Object.values(customerMap)
+    .map(x=>({...x,products:x.products.sort((a,b)=>a.localeCompare(b))}))
+    .sort((a,b)=>a.customer.localeCompare(b.customer));
+
+  return {
+    customers:customers,
+    inventoryProducts:institutionalInventoryProducts_()
+  };
+}
+
+function saveInstitutionalCustomerCore_(payload) {
+  payload=payload||{};
+  const mode=(s_(payload.mode)||'ADD').toUpperCase();
+  const customer=s_(payload.customer).replace(/\s+/g,' ').trim();
+  const status=(s_(payload.status)||'ACTIVE').toUpperCase();
+  const products=(Array.isArray(payload.products)?payload.products:[])
+    .map(x=>s_(x).replace(/\s+/g,' ').trim())
+    .filter(Boolean)
+    .filter((x,i,a)=>a.findIndex(y=>y.toUpperCase()===x.toUpperCase())===i);
+
+  if(!customer)throw new Error('Customer Name is required.');
+  if(!products.length)throw new Error('Add at least one product for this customer.');
+
+  const master=ensureCustomerMaster_();
+  const masters=customerMasterRows_();
+  const existing=masters.find(x=>x.customer.toUpperCase()===customer.toUpperCase());
+
+  if(mode==='ADD' && existing){
+    throw new Error('Customer already exists. Use Edit Customer instead.');
+  }
+
+  if(existing){
+    master.getRange(existing.sheetRow,1,1,4).setValues([[customer,'INSTITUTIONAL',status,new Date()]]);
+  }else{
+    master.appendRow([customer,'INSTITUTIONAL',status,new Date()]);
+  }
+
+  const cps=sheet_(FG_CFG.SHEETS.CUSTOMER_PRODUCTS);
+  ensureColumns_(cps,4);
+  const rows=cps.getLastRow()<2?[]:cps.getRange(2,1,cps.getLastRow()-1,4).getValues();
+
+  // Deactivate current mappings for this customer.
+  rows.forEach((r,i)=>{
+    if(s_(r[0]).toUpperCase()===customer.toUpperCase()){
+      cps.getRange(i+2,4).setValue('NO');
+    }
+  });
+
+  // Activate/update requested products.
+  products.forEach(product=>{
+    let rowNo=0;
+    rows.forEach((r,i)=>{
+      if(s_(r[0]).toUpperCase()===customer.toUpperCase() &&
+         s_(r[1]).toUpperCase()===product.toUpperCase()) rowNo=i+2;
+    });
+    if(rowNo){
+      cps.getRange(rowNo,1,1,4).setValues([[customer,product,'','YES']]);
+    }else{
+      cps.appendRow([customer,product,'','YES']);
+    }
+  });
+
+  SpreadsheetApp.flush();
+  return {
+    ok:true,
+    editor:getInstitutionalCustomerEditorData_(),
+    institutional:getInstitutionalData_(),
+    customers:getCustomers_(),
+    customerGroups:getCustomerGroups_()
+  };
+}
+
+function getInstitutionalData_() {
+  const inv=inventoryRows_();
+  const qty={},codeSet={};
+  inv.forEach(x=>{
+    if(x.marketType.toUpperCase()!=='INSTITUTIONAL')return;
+    const k=x.item.toUpperCase();
+    if(!qty[k])qty[k]={};
+    qty[k][x.internalCode]=(qty[k][x.internalCode]||0)+x.qtyOnHand;
+    codeSet[x.internalCode]=1;
+  });
+
+  const sections=getCustomerGroups_().map(g=>({
+    customer:g.customer,
+    products:g.products.map(item=>({item:item,quantities:qty[item.toUpperCase()]||{}}))
+  }));
+
+  return {
+    codes:Object.keys(codeSet).sort(),
+    sections:sections
+  };
+}
+
+function saveMetalDetectorIncidentCore_(payload) {
+  payload=payload||{};
+  const transferNo=s_(payload.transferNo),item=s_(payload.item),code=s_(payload.internalCode);
+  if(!transferNo)throw new Error('Transfer No. is required.');
+  if(!item)throw new Error('Item is required.');
+  if(!code)throw new Error('Internal Code is required.');
+  if(!s_(payload.checkedBy))throw new Error('Checked By is required.');
+  if(!s_(payload.disposition))throw new Error('Disposition is required.');
+
+  const sh=metalSheet_();
+  let no=s_(payload.incidentNo);
+  if(!no || valueExistsInColumn_(sh,1,no)) no=getNextMetalIncidentNo_();
+  const date=payload.date||today_();
+  const time=s_(payload.time)||Utilities.formatDate(new Date(),FG_CFG.TZ,'HH:mm');
+  sh.appendRow([
+    no,dateObj_(date),time,transferNo,item,code,n_(payload.affectedQty),
+    'METAL DETECTED',s_(payload.description),s_(payload.location),
+    s_(payload.actionTaken),s_(payload.disposition).toUpperCase(),
+    s_(payload.checkedBy),s_(payload.verifiedBy),s_(payload.remarks)
+  ]);
+  SpreadsheetApp.flush();
+  return {ok:true,incidentNo:no,nextIncidentNo:getNextMetalIncidentNo_(),incidents:listMetalIncidents_()};
+}
+
+function hasMetalIncident_(transferNo) {
+  const no=s_(transferNo);
+  const sh=metalSheet_();
+  if(sh.getLastRow()<2)return false;
+  return sh.getRange(2,4,sh.getLastRow()-1,1).getDisplayValues().flat().some(v=>s_(v)===no);
+}
+
+function listMetalIncidents_() {
+  const sh=metalSheet_();
+  if(sh.getLastRow()<2)return [];
+  return sh.getRange(2,1,sh.getLastRow()-1,15).getValues().slice().reverse().map(r=>({
+    incidentNo:s_(r[0]),date:dateText_(r[1]),time:s_(r[2]),transferNo:s_(r[3]),
+    item:s_(r[4]),internalCode:s_(r[5]),affectedQty:n_(r[6]),detectionResult:s_(r[7]),
+    description:s_(r[8]),location:s_(r[9]),actionTaken:s_(r[10]),disposition:s_(r[11]),
+    checkedBy:s_(r[12]),verifiedBy:s_(r[13]),remarks:s_(r[14])
+  }));
+}
+
+function getTransferPrintData_(transmittalNo) {
+  const no=s_(transmittalNo);
+  const tr=transferRows_().filter(r=>s_(r[1])===no);
+  if(!tr.length)throw new Error('Transfer not found: '+no);
+
+  ensureReceiving_();
+  const recvSh=sheet_(FG_CFG.SHEETS.RECEIVING);
+  const rc=recvSh.getLastRow()<2?[]:recvSh.getRange(2,1,recvSh.getLastRow()-1,13).getValues().filter(r=>s_(r[1])===no);
+  const recvMap={};
+  rc.forEach(r=>recvMap[s_(r[3]).toUpperCase()+'||'+s_(r[4]).toUpperCase()]=r);
+
+  const lines=tr.map(r=>{
+    const rr=recvMap[s_(r[3]).toUpperCase()+'||'+s_(r[4]).toUpperCase()]||null;
+    const tx=n_(r[5]), rx=rr?n_(rr[6]):0;
+    return {
+      item:s_(r[3]),internalCode:s_(r[4]),
+      marketType:(s_(r[12])||productInfo_(r[3]).marketType).toUpperCase(),
+      customer:s_(r[13]),
+      transferredQty:tx,
+      receivedQty:rr?rx:'',
+      rejectedQty:rr?(s_(rr[9]).toUpperCase()==='REJECTED'?tx:Math.max(0,tx-rx)):'',
+      remarks:rr?s_(rr[11]):s_(r[11])
+    };
+  });
+
+  return {
+    documentNo:'VGCI-FM-PD-035',
+    revisionNo:'00',
+    pageNo:'1 of 1',
+    effectiveDate:'July 07, 2026',
+    title:'PRODUCT TRANSFER RECEIPT',
+    transmittalNo:no,
+    date:rc.length?dateText_(rc[0][0]):dateText_(tr[0][0]),
+    dateTime:rc.length?dateTimeText_(rc[0][0]):dateTimeText_(tr[0][0]),
+    transferredDateTime:dateTimeText_(tr[0][0]),
+    receivedDateTime:rc.length?dateTimeText_(rc[0][0]):'',
+    from:s_(tr[0][2])||'PRODUCTION',
+    to:'FG WAREHOUSE',
+    transferredBy:s_(tr[0][8]),
+    receivedBy:rc.length?s_(rc[0][10]):'',
+    notedBy:rc.length?s_(rc[0][12]):'',
+    lines:lines
+  };
+}
+
+
+function getTransferredItemTagData_(transmittalNo) {
+  const no=s_(transmittalNo);
+  const tr=transferRows_().filter(r=>s_(r[1])===no);
+  if(!tr.length)throw new Error('Transfer not found: '+no);
+
+  ensureReceiving_();
+  const recvSh=sheet_(FG_CFG.SHEETS.RECEIVING);
+  const rc=recvSh.getLastRow()<2?[]:
+    recvSh.getRange(2,1,recvSh.getLastRow()-1,13).getValues().filter(r=>s_(r[1])===no);
+  const recvMap={};
+  rc.forEach(r=>recvMap[s_(r[3]).toUpperCase()+'||'+s_(r[4]).toUpperCase()]=r);
+
+  return {
+    documentNo:'VGCI-FM-PD-034',
+    revisionNo:'00',
+    pageNo:'1 of 1',
+    effectiveDate:'July 07, 2026',
+    title:'TRANSFERRED ITEM TAG',
+    items:tr.map(r=>{
+      const rr=recvMap[s_(r[3]).toUpperCase()+'||'+s_(r[4]).toUpperCase()]||[];
+      return {
+        transferredDate:dateText_(r[0]),
+        transferredDateTime:dateTimeText_(r[0]),
+        origin:s_(r[2])||'PRODUCTION',
+        itemName:s_(r[3]),
+        qty:n_(r[5]),
+        uom:s_(r[6])||'PACK',
+        internalCodeBatch:s_(r[4]),
+        remarks:s_(r[11]),
+        marketType:(s_(r[12])||productInfo_(r[3]).marketType).toUpperCase(),
+        customer:s_(r[13]),
+        transferredBy:s_(r[8]),
+        receivedBy:rr.length?s_(rr[10]):s_(r[9])
+      };
+    })
+  };
+}
+
+function getFGInventoryPrintData_(marketType) {
+  const type=s_(marketType).toUpperCase()||'INSTITUTIONAL';
+  const physicalInv=inventoryRows_().filter(x=>!type||x.marketType.toUpperCase()===type);
+  const lapsedInv=physicalInv.filter(x=>x.htStatus==='LAPSED');
+  const noHtInv=physicalInv.filter(x=>x.htStatus==='NO HT SET');
+  const inv=physicalInv.filter(x=>x.htStatus==='AVAILABLE');
+
+  const codeTotals={};
+  inv.forEach(x=>{codeTotals[x.internalCode]=(codeTotals[x.internalCode]||0)+x.qtyOnHand});
+  const codes=Object.keys(codeTotals)
+    .sort((a,b)=>{
+      const na=parseInt(a,10),nb=parseInt(b,10);
+      if(isFinite(na)&&isFinite(nb)&&na!==nb)return nb-na;
+      return b.localeCompare(a);
+    })
+    .slice(0,5)
+    .reverse();
+
+  const qty={};
+  inv.forEach(x=>{
+    const k=(x.customer||'INVENTORY COUNT')+'||'+x.item;
+    if(!qty[k])qty[k]={};
+    qty[k][x.internalCode]=(qty[k][x.internalCode]||0)+x.qtyOnHand;
+  });
+
+  let sections=[];
+  if(type==='INSTITUTIONAL'){
+    const groups=getCustomerGroups_();
+    sections=groups.map(g=>({
+      customer:g.customer,
+      products:g.products.map(item=>({
+        item:item,
+        quantities:qty[g.customer+'||'+item]||{},
+        remarks:''
+      }))
+    }));
+
+    const assigned={};
+    groups.forEach(g=>g.products.forEach(p=>assigned[p.toUpperCase()]=1));
+    const unassigned={};
+    inv.forEach(x=>{
+      if(!assigned[x.item.toUpperCase()]){
+        if(!unassigned[x.item])unassigned[x.item]={item:x.item,quantities:{},remarks:''};
+        unassigned[x.item].quantities[x.internalCode]=(unassigned[x.item].quantities[x.internalCode]||0)+x.qtyOnHand;
+      }
+    });
+    const list=Object.values(unassigned).sort((a,b)=>a.item.localeCompare(b.item));
+    if(list.length)sections.push({customer:'INVENTORY COUNT',products:list});
+  }else{
+    const map={};
+    inv.forEach(x=>{
+      if(!map[x.item])map[x.item]={item:x.item,quantities:{},remarks:''};
+      map[x.item].quantities[x.internalCode]=(map[x.item].quantities[x.internalCode]||0)+x.qtyOnHand;
+    });
+    sections=[{customer:'INVENTORY COUNT',products:Object.values(map).sort((a,b)=>a.item.localeCompare(b.item))}];
+  }
+
+  return {
+    documentNo:'VGCI-FM-FGW-009',
+    revisionNo:'02',
+    pageNo:'1 of 1',
+    effectiveDate:'July 08, 2026',
+    title:'FINISHED GOODS INVENTORY FORM',
+    date:today_(),
+    marketType:type,
+    codes:codes,
+    sections:sections,
+    availableQty:inv.reduce((a,x)=>a+x.qtyOnHand,0),
+    lapsedQty:lapsedInv.reduce((a,x)=>a+x.qtyOnHand,0),
+    noHtQty:noHtInv.reduce((a,x)=>a+x.qtyOnHand,0)
+  };
+}
+
+
+function editInventoryBatchCore_(payload) {
+  payload=payload||{};
+  const row=Number(payload.sheetRow);
+  const newQty=n_(payload.newQty);
+  const reason=s_(payload.reason);
+  const editorName=s_(payload.editorName);
+  const pin=s_(payload.pin);
+
+  if(!row || row<2)throw new Error('Invalid inventory row.');
+  if(newQty<0)throw new Error('Inventory quantity cannot be negative.');
+  if(!reason)throw new Error('Reason for inventory adjustment is required.');
+  if(!editorName||!pin)throw new Error('Authorized editor and PIN are required.');
+
+  const auth=inventoryEditors_().find(x=>x.name===editorName && x.pin===pin);
+  if(!auth)throw new Error('Invalid editor or PIN.');
+
+  const sh=sheet_(FG_CFG.SHEETS.INVENTORY);
+  if(row>sh.getLastRow())throw new Error('Inventory row no longer exists.');
+
+  const r=sh.getRange(row,1,1,10).getValues()[0];
+  const item=s_(r[3]), code=s_(r[4]), oldQty=n_(r[6]);
+  if(!item || !code)throw new Error('Invalid inventory batch.');
+
+  const diff=newQty-oldQty;
+  sh.getRange(row,7).setValue(newQty);
+
+  const oldRemarks=s_(r[9]);
+  const stamp=Utilities.formatDate(new Date(),FG_CFG.TZ,'yyyy-MM-dd HH:mm');
+  const audit='Inventory edit: '+oldQty+' → '+newQty+' | '+reason+' | '+auth.name+' | '+stamp;
+  sh.getRange(row,10).setValue(oldRemarks ? oldRemarks+' | '+audit : audit);
+
+  logTxn_({
+    type:'INVENTORY ADJUSTMENT',
+    ref:'INV-EDIT-'+row,
+    marketType:s_(r[1]),
+    customer:s_(r[2]),
+    item:item,
+    internalCode:code,
+    qtyIn:diff>0?diff:0,
+    qtyOut:diff<0?Math.abs(diff):0,
+    user:auth.name,
+    remarks:reason+' | '+oldQty+' → '+newQty
+  });
+
+  SpreadsheetApp.flush();
+  return {
+    ok:true,
+    item:item,
+    internalCode:code,
+    oldQty:oldQty,
+    newQty:newQty,
+    editor:auth.name,
+    dashboard:dashboard_()
+  };
+}
+
+
+function inventoryEditors_(){
+  const sh=sheet_(FG_CFG.SHEETS.LISTS);
+  ensureColumns_(sh,10);
+  const lastRow=sh.getLastRow();
+  if(lastRow<2)return [];
+
+  // Detect the PIN table by header names. This supports the current Lists layout
+  // where Authorized Inventory Editor / Inventory PIN / Status are in H:J.
+  let headerRow=1;
+  let headers=sh.getRange(1,1,1,10).getValues()[0].map(v=>s_(v).trim());
+  let nameCol=headers.findIndex(h=>h.toUpperCase()==='AUTHORIZED INVENTORY EDITOR');
+  let pinCol=headers.findIndex(h=>h.toUpperCase()==='INVENTORY PIN');
+  let statusCol=headers.findIndex(h=>h.toUpperCase()==='STATUS');
+
+  if(nameCol<0 || pinCol<0){
+    headerRow=2;
+    headers=sh.getRange(2,1,1,10).getValues()[0].map(v=>s_(v).trim());
+    nameCol=headers.findIndex(h=>h.toUpperCase()==='AUTHORIZED INVENTORY EDITOR');
+    pinCol=headers.findIndex(h=>h.toUpperCase()==='INVENTORY PIN');
+    statusCol=headers.findIndex(h=>h.toUpperCase()==='STATUS');
+  }
+
+  if(nameCol<0 || pinCol<0)return [];
+
+  const startRow=headerRow+1;
+  const count=lastRow-startRow+1;
+  if(count<1)return [];
+
+  return sh.getRange(startRow,1,count,10).getValues()
+    .map(r=>({
+      name:s_(r[nameCol]),
+      pin:s_(r[pinCol]),
+      status:statusCol>=0?s_(r[statusCol]).toUpperCase():'ACTIVE'
+    }))
+    .filter(x=>x.name&&x.pin)
+    .filter(x=>!['INACTIVE','NO','FALSE','0'].includes(x.status));
+}
+
+function verifyInventoryEditorPin_(payload){
+  payload=payload||{};
+  const name=s_(payload.name);
+  const pin=s_(payload.pin);
+  if(!name||!pin)throw new Error('Editor name and PIN are required.');
+  const hit=inventoryEditors_().find(x=>x.name===name && x.pin===pin);
+  if(!hit)throw new Error('Invalid editor or PIN.');
+  return {ok:true,name:hit.name};
+}
+
+function getInventoryEditors_(){
+  return inventoryEditors_().map(x=>x.name);
+}
+
+
+function ensureMetalDetectionPage2_() {
+  const ss=ss_();
+  let sh=ss.getSheetByName('Metal Detection Page 2');
+  if(!sh){
+    sh=ss.insertSheet('Metal Detection Page 2');
+    sh.getRange(1,1,1,13).setValues([[
+      'Incident No.','Date','Time','Transfer No.','Product',
+      'Production Code (Julian Date) and Batch No.','Correction',
+      'Metal Contaminant Present (YES / NO)','Corrective Action',
+      'Checked By','Remarks','Completed','Completed Date/Time'
+    ]]);
+    sh.setFrozenRows(1);
+  }
+  return sh;
+}
+
+function saveMetalDetectionPage2Core_(payload) {
+  payload=payload||{};
+  const incident=s_(payload.incidentNo), product=s_(payload.product), code=s_(payload.internalCode);
+  if(!incident)throw new Error('Monitoring No. is required.');
+  if(!product)throw new Error('Product is required.');
+  if(!code)throw new Error('Production Code / Batch No. is required.');
+
+  const sh=ensureMetalDetectionPage2_();
+  const data=sh.getLastRow()<2?[]:sh.getRange(2,1,sh.getLastRow()-1,13).getValues();
+
+  // Multiple failed products can share one Monitoring No.
+  // Update only the matching Monitoring No. + Product + Production Code row.
+  const idx=data.findIndex(r=>
+    s_(r[0])===incident &&
+    s_(r[4])===product &&
+    s_(r[5])===code
+  );
+
+  const complete=!!(
+    s_(payload.date)&&s_(payload.correction)&&
+    s_(payload.contaminantPresent)&&s_(payload.correctiveAction)
+  );
+  const completedAt=complete
+    ? Utilities.formatDate(new Date(),FG_CFG.TZ,'yyyy-MM-dd HH:mm')
+    : '';
+
+  const row=[
+    incident,dateObj_(payload.date||today_()),time24_(payload.time),
+    s_(payload.transferNo),product,code,s_(payload.correction),
+    s_(payload.contaminantPresent).toUpperCase(),
+    s_(payload.correctiveAction),s_(payload.checkedBy),s_(payload.remarks),
+    complete?'YES':'NO',completedAt
+  ];
+
+  if(idx>=0)sh.getRange(idx+2,1,1,13).setValues([row]);
+  else sh.appendRow(row);
+
+  SpreadsheetApp.flush();
+  return {ok:true,complete:complete,completedAt:completedAt};
+}
+
+function getMetalDetectorRecord_(incidentNo) {
+  const no=s_(incidentNo);
+  const sh=metalSheet_();
+  const data=sh.getLastRow()<2?[]:sh.getRange(2,1,sh.getLastRow()-1,15).getValues();
+  const p1=data.find(r=>s_(r[0])===no);
+  if(!p1)throw new Error('Metal Detector record not found: '+no);
+
+  const sh2=ensureMetalDetectionPage2_();
+  const d2=sh2.getLastRow()<2?[]:sh2.getRange(2,1,sh2.getLastRow()-1,13).getValues();
+  const r2=d2.find(r=>s_(r[0])===no);
+
+  return {
+    page1:{
+      incidentNo:s_(p1[0]),date:dateText_(p1[1]),time:s_(p1[2]),transferNo:s_(p1[3]),
+      product:s_(p1[4]),internalCode:s_(p1[5]),affectedQty:n_(p1[6]),
+      detectionResult:s_(p1[7]),description:s_(p1[8]),location:s_(p1[9]),
+      actionTaken:s_(p1[10]),disposition:s_(p1[11]),checkedBy:s_(p1[12]),
+      verifiedBy:s_(p1[13]),remarks:s_(p1[14])
+    },
+    page2:r2?{
+      incidentNo:s_(r2[0]),date:dateText_(r2[1]),time:s_(r2[2]),transferNo:s_(r2[3]),
+      product:s_(r2[4]),internalCode:s_(r2[5]),correction:s_(r2[6]),
+      contaminantPresent:s_(r2[7]),correctiveAction:s_(r2[8]),checkedBy:s_(r2[9]),
+      remarks:s_(r2[10]),complete:s_(r2[11])==='YES',completedAt:s_(r2[12])
+    }:null
+  };
+}
+
+
+function getInventoryPinStatus_(){
+  const editors=inventoryEditors_();
+  return {
+    configured:editors.length>0,
+    editors:editors.map(x=>x.name),
+    instruction:editors.length
+      ? 'PIN access configured.'
+      : 'Configure Lists columns H:J as: Authorized Inventory Editor | Inventory PIN | Status'
+  };
+}
+
+
+
+function time24_(v){
+  if(v===null||v===undefined||v==='')return '';
+  if(Object.prototype.toString.call(v)==='[object Date]'&&!isNaN(v)){
+    return Utilities.formatDate(v,FG_CFG.TZ,'HH:mm');
+  }
+  const t=s_(v).trim();
+  let m=t.match(/^(\d{1,2}):(\d{2})(?::\d{2})?$/);
+  if(m)return String(Number(m[1])).padStart(2,'0')+':'+m[2];
+  m=t.match(/^(\d{1,2}):(\d{2})\s*(AM|PM)$/i);
+  if(m){
+    let h=Number(m[1])%12;
+    if(m[3].toUpperCase()==='PM')h+=12;
+    return String(h).padStart(2,'0')+':'+m[2];
+  }
+  const d=new Date(v);
+  if(!isNaN(d))return Utilities.formatDate(d,FG_CFG.TZ,'HH:mm');
+  return t;
+}
+
+function ensureMetalMonitoring_(){
+  const ss=ss_();
+  let sh=ss.getSheetByName(FG_CFG.SHEETS.METAL_MONITORING);
+  if(!sh){
+    sh=ss.insertSheet(FG_CFG.SHEETS.METAL_MONITORING);
+  }
+  ensureColumns_(sh,29);
+  const headers=[
+    'Monitoring No.','Date','Receiving Row','Transfer No.','Product',
+    'Production Code (Julian Date) / Batch No.','Qty Received','Assigned Personnel',
+    'Ferrous 2.5mm','Non-Ferrous 3.5mm','Stainless 3.0mm',
+    'Time Started','Time Finished','Shift','Final Result',
+    'Corrective Action','Remarks','Verified By','Inventory Posted','Inventory Posted Date/Time',
+    'Received By','Market Type','Customer','Unit','Qty Pass','Qty Hold / Failed',
+    'Start-up W/O Product - Ferrous 2.5mm','Start-up W/O Product - Non-Ferrous 3.5mm','Start-up W/O Product - Stainless 3.0mm'
+  ];
+  const current=sh.getRange(1,1,1,29).getValues()[0];
+  headers.forEach((h,i)=>{ if(!s_(current[i])) sh.getRange(1,i+1).setValue(h); });
+  sh.setFrozenRows(1);
+  return sh;
+}
+
+function getNextMetalMonitoringNo_(){
+  const sh=ensureMetalMonitoring_();
+  let max=0;
+  if(sh.getLastRow()>=2){
+    sh.getRange(2,1,sh.getLastRow()-1,1).getDisplayValues().flat().forEach(v=>{
+      const m=s_(v).match(/(\d+)$/); if(m)max=Math.max(max,Number(m[1]));
+    });
+  }
+  return 'MD-'+String(max+1).padStart(5,'0');
+}
+
+function metalMonitoringRows_(){
+  const sh=ensureMetalMonitoring_();
+  if(sh.getLastRow()<2)return [];
+  return sh.getRange(2,1,sh.getLastRow()-1,29).getValues().map((r,i)=>{
+    const qtyReceived=n_(r[6]);
+    let qtyPass=r[24]===''?null:n_(r[24]);
+    if(qtyPass===null) qtyPass=s_(r[18]).toUpperCase()==='YES'?qtyReceived:0;
+    const qtyHold=r[25]===''?Math.max(0,qtyReceived-qtyPass):n_(r[25]);
+    return {
+      sheetRow:i+2,
+      monitoringNo:s_(r[0]),date:dateText_(r[1]),dateTime:dateTimeText_(r[1]),receivingRow:Number(r[2])||0,
+      transferNo:s_(r[3]),product:s_(r[4]),internalCode:s_(r[5]),qtyReceived:qtyReceived,
+      assignedPersonnel:s_(r[7]),ferrous:s_(r[8]),nonFerrous:s_(r[9]),stainless:s_(r[10]),
+      timeStarted:time24_(r[11]),timeFinished:time24_(r[12]),shift:s_(r[13]),finalResult:s_(r[14]),
+      correctiveAction:s_(r[15]),remarks:s_(r[16]),verifiedBy:s_(r[17]),
+      inventoryPosted:s_(r[18]).toUpperCase()==='YES',inventoryPostedAt:s_(r[19]),
+      receivedBy:s_(r[20]),marketType:s_(r[21]),customer:s_(r[22]),unit:s_(r[23]),
+      qtyPass:qtyPass,qtyHold:qtyHold,
+      startupFerrous:s_(r[26]),startupNonFerrous:s_(r[27]),startupStainless:s_(r[28])
+    };
+  });
+}
+
+function getMetalDetectionQueue_(){
+  ensureReceiving_();
+  const recv=sheet_(FG_CFG.SHEETS.RECEIVING);
+  if(recv.getLastRow()<2)return [];
+  const monitored={};
+  metalMonitoringRows_().forEach(x=>{ if(x.receivingRow)monitored[x.receivingRow]=x; });
+
+  return recv.getRange(2,1,recv.getLastRow()-1,13).getValues().map((r,i)=>{
+    const row=i+2, qty=n_(r[6]), recStatus=s_(r[9]).toUpperCase();
+    return {
+      receivingRow:row,receiptDate:dateText_(r[0]),transferNo:s_(r[1]),from:s_(r[2]),
+      product:s_(r[3]),internalCode:s_(r[4]),qtyTransferred:n_(r[5]),qtyReceived:qty,
+      unit:s_(r[7]),metalStatus:s_(r[8]),receivingStatus:s_(r[9]),receivedBy:s_(r[10]),
+      remarks:s_(r[11]),notedBy:s_(r[12]),monitoring:monitored[row]||null
+    };
+  }).filter(x=>x.qtyReceived>0 && !x.monitoring);
+}
+
+function findTransmittalForReceiving_(receivingRow){
+  const recv=sheet_(FG_CFG.SHEETS.RECEIVING);
+  const rr=recv.getRange(Number(receivingRow),1,1,14).getValues()[0];
+  const no=s_(rr[1]), item=s_(rr[3]), code=s_(rr[4]);
+  const trSh=sheet_(FG_CFG.SHEETS.TRANSMITTAL);
+  if(trSh.getLastRow()<2)throw new Error('Transmittal record not found.');
+  // V140: receiving rows now store their exact transmittal row (column N)
+  const exactRow=n_(rr[13]);
+  if(exactRow>=2 && exactRow<=trSh.getLastRow()){
+    const t=trSh.getRange(exactRow,1,1,14).getValues()[0];
+    if(s_(t[1])===no && s_(t[3])===item) return {receiving:rr.slice(0,13),transmittal:t};
+  }
+  const trs=trSh.getRange(2,1,trSh.getLastRow()-1,14).getValues();
+  const tr=trs.find(r=>s_(r[1])===no && s_(r[3])===item && s_(r[4])===code);
+  if(!tr)throw new Error('Matching Transmittal line not found.');
+  return {receiving:rr,transmittal:tr};
+}
+
+function saveMetalMonitoringCore_(payload){
+  payload=payload||{};
+  const receivingRow=Number(payload.receivingRow);
+  if(!receivingRow||receivingRow<2)throw new Error('Select an FG Receiving record.');
+  if(!s_(payload.assignedPersonnel))throw new Error('Assigned Personnel is required.');
+  if(!s_(payload.ferrous))throw new Error('Ferrous 2.5mm result is required.');
+  if(!s_(payload.nonFerrous))throw new Error('Non-Ferrous 3.5mm result is required.');
+  if(!s_(payload.stainless))throw new Error('Stainless 3.0mm result is required.');
+  if(!s_(payload.timeStarted))throw new Error('Time Started is required.');
+  if(!s_(payload.shift))throw new Error('Shift is required.');
+  const result=s_(payload.finalResult).toUpperCase();
+  if(!['PASS','FAIL'].includes(result))throw new Error('Select PASS or FAIL.');
+
+  const existing=metalMonitoringRows_().find(x=>x.receivingRow===receivingRow);
+  if(existing)throw new Error('This FG Receiving line already has a Metal Detection record.');
+
+  const refs=findTransmittalForReceiving_(receivingRow);
+  const rr=refs.receiving, tr=refs.transmittal;
+  let no=s_(payload.monitoringNo);
+  if(!no || valueExistsInColumn_(ensureMetalMonitoring_(),1,no)) no=getNextMetalMonitoringNo_();
+  const date=payload.date||dateText_(rr[0])||today_();
+  const qty=n_(rr[6]);
+  const market=s_(tr[12]), customer=s_(tr[13]), unit=s_(rr[7])||s_(tr[6]);
+
+  let inventoryPosted='NO', postedAt='';
+  if(result==='PASS'){
+    addInventory_(date,tr,qty);
+    inventoryPosted='YES';
+    postedAt=Utilities.formatDate(new Date(),FG_CFG.TZ,'yyyy-MM-dd HH:mm');
+    logTxn_({
+      type:'METAL DETECTION PASS / FG RELEASE',ref:s_(rr[1]),marketType:market,customer:customer,
+      item:s_(rr[3]),internalCode:s_(rr[4]),qtyIn:qty,qtyOut:0,
+      user:s_(payload.assignedPersonnel),remarks:'Released to FG Inventory after metal detection.'
+    });
+  }
+
+  const sh=ensureMetalMonitoring_();
+  sh.appendRow([
+    no,dateObj_(date),receivingRow,s_(rr[1]),s_(rr[3]),s_(rr[4]),qty,
+    s_(payload.assignedPersonnel),s_(payload.ferrous).toUpperCase(),
+    s_(payload.nonFerrous).toUpperCase(),s_(payload.stainless).toUpperCase(),
+    time24_(payload.timeStarted),Utilities.formatDate(new Date(),FG_CFG.TZ,'HH:mm'),s_(payload.shift),result,
+    s_(payload.correctiveAction),s_(payload.remarks),s_(payload.verifiedBy),
+    inventoryPosted,postedAt,s_(rr[10]),market,customer,unit
+  ]);
+
+  const recv=sheet_(FG_CFG.SHEETS.RECEIVING);
+  recv.getRange(receivingRow,9).setValue(result);
+  if(result==='PASS'){
+    const finalStatus=n_(rr[6])===n_(rr[5])?'RECEIVED':'WITH VARIANCE';
+    recv.getRange(receivingRow,10).setValue(finalStatus);
+  }else{
+    recv.getRange(receivingRow,10).setValue('HOLD - METAL DETECTION');
+  }
+
+  SpreadsheetApp.flush();
+  return {
+    ok:true,monitoringNo:no,result:result,requiresPage2:result==='FAIL',
+    inventoryPosted:inventoryPosted==='YES',
+    nextMonitoringNo:getNextMetalMonitoringNo_(),
+    queue:getMetalDetectionQueue_(),
+    history:listMetalMonitoring_(),
+    dashboard:dashboard_()
+  };
+}
+function saveMetalMonitoring_(payload){return withWriteLock_(function(){return saveMetalMonitoringCore_(payload);});}
+
+function listMetalMonitoring_(){
+  return metalMonitoringRows_().slice().reverse();
+}
+
+function getMetalMonitoringRecord_(monitoringNo){
+  const no=s_(monitoringNo);
+  const p1=metalMonitoringRows_().find(x=>x.monitoringNo===no);
+  if(!p1)throw new Error('Metal Detector Monitoring record not found.');
+
+  const sh2=ensureMetalDetectionPage2_();
+  let p2=null;
+  if(sh2.getLastRow()>=2){
+    const r=sh2.getRange(2,1,sh2.getLastRow()-1,13).getValues().find(r=>s_(r[0])===no);
+    if(r)p2={
+      incidentNo:s_(r[0]),date:dateText_(r[1]),time:s_(r[2]),transferNo:s_(r[3]),
+      product:s_(r[4]),internalCode:s_(r[5]),correction:s_(r[6]),
+      contaminantPresent:s_(r[7]),correctiveAction:s_(r[8]),checkedBy:s_(r[9]),
+      remarks:s_(r[10]),complete:s_(r[11])==='YES',completedAt:s_(r[12])
+    };
+  }
+  return {page1:p1,page2:p2};
+}
+
+
+
+
+
+function saveMetalMonitoringBatchCore_(payload) {
+  payload=payload||{};
+  const items=Array.isArray(payload.items)?payload.items:[];
+  if(!items.length)throw new Error('Select at least one received product.');
+  if(!s_(payload.assignedPersonnel))throw new Error('Assigned Personnel is required.');
+  if(!s_(payload.timeStarted))throw new Error('Time Started is required.');
+  if(!s_(payload.shift))throw new Error('Shift is required.');
+
+  // Start-up challenge: one time only at the beginning of this monitoring transaction, W/O product.
+  const sf=s_(payload.startupFerrous).toUpperCase();
+  const sn=s_(payload.startupNonFerrous).toUpperCase();
+  const ss=s_(payload.startupStainless).toUpperCase();
+  if(!sf||!sn||!ss)throw new Error('Complete the Start-up Test Piece W/O Product (Ferrous, Non-Ferrous, Stainless).');
+  if(!['PASS','FAIL'].includes(sf)||!['PASS','FAIL'].includes(sn)||!['PASS','FAIL'].includes(ss))
+    throw new Error('Invalid Start-up Test Piece W/O Product result.');
+  const startupVerified=sf==='PASS'&&sn==='PASS'&&ss==='PASS';
+
+  const sh=ensureMetalMonitoring_();
+  let monitoringNo=s_(payload.monitoringNo);
+  if(!monitoringNo || valueExistsInColumn_(sh,1,monitoringNo)) monitoringNo=getNextMetalMonitoringNo_();
+  const recv=sheet_(FG_CFG.SHEETS.RECEIVING);
+  const existingRows=metalMonitoringRows_();
+  const saved=[];
+  const productTests={}; // one W/ Product challenge result per Product
+  let anyHoldFail=false;
+  const autoFinished=Utilities.formatDate(new Date(),FG_CFG.TZ,'HH:mm');
+
+  items.forEach((item,idx)=>{
+    const receivingRow=Number(item.receivingRow);
+    if(!receivingRow||receivingRow<2)throw new Error('Invalid receiving row at item '+(idx+1)+'.');
+    if(existingRows.some(x=>x.receivingRow===receivingRow))
+      throw new Error('Already processed in Metal Detection: '+s_(item.product));
+
+    // W/ Product challenge is required once for each new Product in this monitoring transaction.
+    const ferrous=s_(item.ferrous).toUpperCase();
+    const nonFerrous=s_(item.nonFerrous).toUpperCase();
+    const stainless=s_(item.stainless).toUpperCase();
+    if(!ferrous||!nonFerrous||!stainless)throw new Error('Complete Test Piece W/ Product for '+s_(item.product)+'.');
+    if(!['PASS','FAIL'].includes(ferrous)||!['PASS','FAIL'].includes(nonFerrous)||!['PASS','FAIL'].includes(stainless))
+      throw new Error('Invalid Test Piece W/ Product result for '+s_(item.product)+'.');
+    const withProductVerified=ferrous==='PASS'&&nonFerrous==='PASS'&&stainless==='PASS';
+    const productKey=s_(item.product).toUpperCase();
+    if(productTests[productKey]){
+      const t=productTests[productKey];
+      if(t.ferrous!==ferrous||t.nonFerrous!==nonFerrous||t.stainless!==stainless)
+        throw new Error('Only one Test Piece W/ Product result is allowed per Product: '+s_(item.product)+'.');
+    }else{
+      productTests[productKey]={ferrous:ferrous,nonFerrous:nonFerrous,stainless:stainless};
+    }
+
+    const refs=findTransmittalForReceiving_(receivingRow);
+    const rr=refs.receiving, tr=refs.transmittal;
+    const qty=n_(rr[6]), market=s_(tr[12]), customer=s_(tr[13]), unit=s_(rr[7])||s_(tr[6]);
+    const qtyPass=n_(item.qtyPass);
+    if(qtyPass<0||qtyPass>qty)throw new Error('Qty Pass must be from 0 to '+qty+' for '+s_(rr[3])+'.');
+    const qtyHold=Math.max(0,qty-qtyPass);
+
+    // Product result is independent from challenge-test verification.
+    const productResult=s_(item.productResult).toUpperCase();
+    if(!['PASS','HOLD','FAIL'].includes(productResult))
+      throw new Error('Select the actual Product Result (PASS, HOLD, or FAIL) for '+s_(rr[3])+'.');
+    if(productResult==='PASS' && qtyHold>0)
+      throw new Error('Product Result cannot be PASS while Qty Hold is greater than zero for '+s_(rr[3])+'.');
+
+    // A failed challenge test means the detector is not verified; no quantity may be released.
+    if((!startupVerified || !withProductVerified) && qtyPass>0)
+      throw new Error('Metal Detector verification is NOT VERIFIED for '+s_(rr[3])+' / '+s_(rr[4])+'. Set Qty Pass to 0 and hold the batch until the detector is verified.');
+    if((!startupVerified || !withProductVerified) && productResult==='PASS')
+      throw new Error('Product Result cannot be PASS while Metal Detector verification is NOT VERIFIED for '+s_(rr[3])+'.');
+
+    if((productResult==='HOLD'||productResult==='FAIL'||qtyHold>0||!startupVerified||!withProductVerified) && !s_(item.correctiveAction))
+      throw new Error('Corrective Action is required for held/failed/not-verified batch: '+s_(rr[3]));
+
+    let inventoryPosted='NO', postedAt='';
+    if(qtyPass>0 && startupVerified && withProductVerified){
+      addInventory_(payload.date||dateText_(rr[0])||today_(),tr,qtyPass);
+      inventoryPosted='YES';
+      postedAt=Utilities.formatDate(new Date(),FG_CFG.TZ,'yyyy-MM-dd HH:mm');
+      logTxn_({
+        type:'METAL DETECTION FG RELEASE',ref:s_(rr[1]),marketType:market,customer:customer,
+        item:s_(rr[3]),internalCode:s_(rr[4]),qtyIn:qtyPass,qtyOut:0,
+        user:s_(payload.assignedPersonnel),remarks:'Qty Pass '+qtyPass+' of '+qty+' released to FG Inventory. Product Result: '+productResult+'. Monitoring '+monitoringNo
+      });
+    }
+    if(productResult!=='PASS'||qtyHold>0||!startupVerified||!withProductVerified)anyHoldFail=true;
+
+    sh.appendRow([
+      monitoringNo,new Date(),receivingRow,s_(rr[1]),s_(rr[3]),s_(rr[4]),qty,
+      s_(payload.assignedPersonnel),ferrous,nonFerrous,stainless,
+      time24_(payload.timeStarted),autoFinished,s_(payload.shift),productResult,
+      s_(item.correctiveAction),s_(item.remarks),'',
+      inventoryPosted,postedAt,s_(rr[10]),market,customer,unit,qtyPass,qtyHold,
+      sf,sn,ss
+    ]);
+
+    recv.getRange(receivingRow,9).setValue(productResult);
+    let recvStatus='HOLD - METAL DETECTION';
+    if(productResult==='PASS' && qtyHold===0 && startupVerified && withProductVerified)
+      recvStatus=n_(rr[6])===n_(rr[5])?'RECEIVED':'WITH VARIANCE';
+    else if(qtyPass>0) recvStatus='PARTIAL RELEASE / HOLD';
+    else if(!startupVerified||!withProductVerified) recvStatus='HOLD - DETECTOR NOT VERIFIED';
+    recv.getRange(receivingRow,10).setValue(recvStatus);
+
+    saved.push({
+      monitoringNo:monitoringNo,receivingRow:receivingRow,transferNo:s_(rr[1]),product:s_(rr[3]),
+      internalCode:s_(rr[4]),qtyReceived:qty,qtyPass:qtyPass,qtyHold:qtyHold,result:productResult,
+      startupVerified:startupVerified,withProductVerified:withProductVerified,
+      timeStarted:time24_(payload.timeStarted),timeFinished:autoFinished
+    });
+  });
+
+  SpreadsheetApp.flush();
+  return {
+    ok:true,monitoringNo:monitoringNo,items:saved,requiresPage2:anyHoldFail,timeFinished:autoFinished,
+    startupVerified:startupVerified,
+    nextMonitoringNo:getNextMetalMonitoringNo_(),queue:getMetalDetectionQueue_(),
+    history:listMetalMonitoring_(),dashboard:dashboard_()
+  };
+}
+
+function getMetalMonitoringBatchRecords_(monitoringNo){
+  const no=s_(monitoringNo);
+  const rows=metalMonitoringRows_().filter(x=>x.monitoringNo===no);
+  if(!rows.length)throw new Error('Metal Detector Monitoring record not found.');
+  const sh2=ensureMetalDetectionPage2_();
+  let p2=[];
+  if(sh2.getLastRow()>=2){
+    p2=sh2.getRange(2,1,sh2.getLastRow()-1,13).getValues()
+      .filter(r=>s_(r[0])===no)
+      .map(r=>({
+        incidentNo:s_(r[0]),date:dateText_(r[1]),time:s_(r[2]),transferNo:s_(r[3]),
+        product:s_(r[4]),internalCode:s_(r[5]),correction:s_(r[6]),
+        contaminantPresent:s_(r[7]),correctiveAction:s_(r[8]),checkedBy:s_(r[9]),
+        remarks:s_(r[10]),complete:s_(r[11])==='YES',completedAt:s_(r[12])
+      }));
+  }
+  return {page1:rows,page2:p2};
+}
+
+
+
+
+function normTrace_(v){
+  return s_(v).replace(/\s+/g,' ').trim().toUpperCase();
+}
+
+function traceSheetRows_(sheetName,cols){
+  const sh=ss_().getSheetByName(sheetName);
+  if(!sh || sh.getLastRow()<2)return [];
+  const width=Math.min(cols,sh.getLastColumn());
+  if(width<1)return [];
+  return sh.getRange(2,1,sh.getLastRow()-1,width).getValues();
+}
+
+function getTraceabilityProducts_(){
+  // Fast index: every source below is already a real traceability stage,
+  // so do NOT call getProductTraceability_() once per product.
+  const map={};
+  const add=v=>{
+    const raw=s_(v).replace(/\s+/g,' ').trim();
+    if(raw)map[normTrace_(raw)]=raw;
+  };
+
+  traceSheetRows_(FG_CFG.SHEETS.TRANSMITTAL,14).forEach(r=>add(r[3]));
+  traceSheetRows_(FG_CFG.SHEETS.RECEIVING,13).forEach(r=>add(r[3]));
+
+  try{
+    const sh=ss_().getSheetByName(FG_CFG.SHEETS.METAL_MONITORING);
+    if(sh && sh.getLastRow()>=2 && sh.getLastColumn()>=5){
+      sh.getRange(2,5,sh.getLastRow()-1,1).getDisplayValues().flat().forEach(add);
+    }
+  }catch(_){}
+
+  try{
+    const sh=ss_().getSheetByName(FG_CFG.SHEETS.INVENTORY);
+    if(sh && sh.getLastRow()>=2 && sh.getLastColumn()>=4){
+      sh.getRange(2,4,sh.getLastRow()-1,1).getDisplayValues().flat().forEach(add);
+    }
+  }catch(_){}
+
+  try{
+    const sh=ss_().getSheetByName(FG_CFG.SHEETS.ALLOCATION);
+    if(sh && sh.getLastRow()>=2 && sh.getLastColumn()>=5){
+      sh.getRange(2,5,sh.getLastRow()-1,1).getDisplayValues().flat().forEach(add);
+    }
+  }catch(_){}
+
+  try{
+    const sh=ss_().getSheetByName(FG_CFG.SHEETS.PDR);
+    if(sh && sh.getLastRow()>=2 && sh.getLastColumn()>=6){
+      sh.getRange(2,6,sh.getLastRow()-1,1).getDisplayValues().flat().forEach(add);
+    }
+  }catch(_){}
+
+  return Object.values(map).sort((a,b)=>a.localeCompare(b));
+}
+
+
+function getTraceabilityCodes_(product){
+  const key=normTrace_(product);
+  if(!key)return [];
+
+  const codes={};
+  const add=v=>{
+    const raw=s_(v).replace(/\s+/g,' ').trim();
+    if(raw && raw!=='(NO CODE)')codes[normTrace_(raw)]=raw;
+  };
+
+  // Production Transmittal: Product col D / Internal Code col E
+  traceSheetRows_(FG_CFG.SHEETS.TRANSMITTAL,14)
+    .filter(r=>normTrace_(r[3])===key)
+    .forEach(r=>add(r[4]));
+
+  // FG Receiving: Product col D / Internal Code col E
+  traceSheetRows_(FG_CFG.SHEETS.RECEIVING,13)
+    .filter(r=>normTrace_(r[3])===key)
+    .forEach(r=>add(r[4]));
+
+  // Metal Detection
+  try{
+    metalMonitoringRows_()
+      .filter(x=>normTrace_(x.product)===key)
+      .forEach(x=>add(x.internalCode));
+  }catch(_){}
+
+  // Current Inventory
+  try{
+    inventoryRows_()
+      .filter(x=>normTrace_(x.item)===key)
+      .forEach(x=>add(x.internalCode));
+  }catch(_){}
+
+  // Product Disposition Report
+  try{
+    pdrRows_().filter(x=>normTrace_(x.product)===key).forEach(x=>add(x.internalCode));
+  }catch(_){}
+
+  // Allocation: Product col E / Internal Code col F
+  const al=ss_().getSheetByName(FG_CFG.SHEETS.ALLOCATION);
+  if(al && al.getLastRow()>=2 && al.getLastColumn()>=6){
+    al.getRange(2,1,al.getLastRow()-1,Math.min(14,al.getLastColumn())).getValues()
+      .filter(r=>normTrace_(r[4])===key)
+      .forEach(r=>add(r[5]));
+  }
+
+  return Object.values(codes).sort((a,b)=>a.localeCompare(b));
+}
+
+
+function ensurePDR_(){
+  let sh=ss_().getSheetByName(FG_CFG.SHEETS.PDR);
+  const headers=[
+    'PDR No.','Date','Reference Type','Reference No.','Area / Department / Customer',
+    'Product Received Date','Category','Concern / Problem','Product Name','Internal Code',
+    'Batch No.','Expiration Date','Input Quantity','Output Quantity','Initial Disposition',
+    'Final Disposition','Final Qty','Remarks','Status','Created By','Last Updated'
+  ];
+  if(!sh){
+    sh=ss_().insertSheet(FG_CFG.SHEETS.PDR);
+    sh.getRange(1,1,1,headers.length).setValues([headers]);
+    sh.setFrozenRows(1);
+  }else{
+    ensureColumns_(sh,headers.length);
+    if(sh.getLastRow()===0 || !s_(sh.getRange(1,1).getValue())){
+      sh.getRange(1,1,1,headers.length).setValues([headers]);
+      sh.setFrozenRows(1);
+    }
+  }
+  return sh;
+}
+
+function nextPDRNo_(){
+  const sh=ensurePDR_();
+  const year=Utilities.formatDate(new Date(),FG_CFG.TZ,'yyyy');
+  let max=0;
+  if(sh.getLastRow()>=2){
+    sh.getRange(2,1,sh.getLastRow()-1,1).getDisplayValues().flat().forEach(v=>{
+      const m=s_(v).match(/^PDR-(\d{4})-(\d+)$/i);
+      if(m && m[1]===year)max=Math.max(max,Number(m[2])||0);
+    });
+  }
+  return 'PDR-'+year+'-'+String(max+1).padStart(4,'0');
+}
+
+function pdrRows_(){
+  const sh=ensurePDR_();
+  if(sh.getLastRow()<2)return [];
+  return sh.getRange(2,1,sh.getLastRow()-1,21).getValues().map((r,i)=>({
+    sheetRow:i+2,
+    pdrNo:s_(r[0]),date:dateText_(r[1]),dateTime:dateTimeText_(r[1]),referenceType:s_(r[2]),referenceNo:s_(r[3]),
+    area:s_(r[4]),productReceivedDate:dateText_(r[5]),category:s_(r[6]),concern:s_(r[7]),
+    product:s_(r[8]),internalCode:s_(r[9]),batchNo:s_(r[10]),expirationDate:dateText_(r[11]),
+    inputQty:n_(r[12]),outputQty:n_(r[13]),initialDisposition:s_(r[14]),
+    finalDisposition:s_(r[15]),finalQty:n_(r[16]),remarks:s_(r[17]),status:s_(r[18])||'OPEN',
+    createdBy:s_(r[19]),updated:r[20] ? dateTimeText_(r[20]) : ''
+  })).filter(x=>x.pdrNo);
+}
+
+function getPDRData_(){
+  ensurePDR_();
+  const failures=[];
+  try{
+    metalMonitoringRows_().forEach(x=>{
+      if(x.finalResult==='FAIL' || n_(x.qtyHold)>0){
+        let sourceArea='', productReceivedDate=x.date, sourceTransfer=x.transferNo;
+        try{
+          const recv=sheet_(FG_CFG.SHEETS.RECEIVING);
+          if(x.receivingRow>=2 && x.receivingRow<=recv.getLastRow()){
+            const rr=recv.getRange(x.receivingRow,1,1,13).getValues()[0];
+            productReceivedDate=dateText_(rr[0])||x.date;
+            sourceArea=s_(rr[2]);
+            sourceTransfer=s_(rr[1])||x.transferNo;
+          }
+        }catch(_){}
+        failures.push({
+          referenceType:'METAL DETECTION',
+          referenceNo:x.monitoringNo,
+          transferNo:sourceTransfer,
+          date:x.date,
+          dateTime:x.dateTime||x.date,
+          productReceivedDate:productReceivedDate,
+          area:sourceArea,
+          product:x.product,
+          internalCode:x.internalCode,
+          affectedQty:n_(x.qtyHold)>0?n_(x.qtyHold):n_(x.qtyReceived),
+          concern:'METAL DETECTED / FOOD SAFETY'
+        });
+      }
+    });
+  }catch(_){}
+  return {
+    nextPDRNo:nextPDRNo_(),
+    today:today_(),
+    products:getProducts_().map(x=>x.item),
+    users:getUsers_(),
+    metalFailures:failures,
+    history:pdrRows_().slice().reverse()
+  };
+}
+
+function getPDRRecord_(pdrNo){
+  const x=pdrRows_().find(r=>r.pdrNo===s_(pdrNo));
+  if(!x)throw new Error('PDR record not found.');
+  return x;
+}
+
+function savePDRCore_(payload){
+  payload=payload||{};
+  const sh=ensurePDR_();
+  // V135: only overwrite an existing PDR when the user opened it with Edit.
+  // A NEW PDR whose number was taken by another user gets the next number instead
+  // of silently overwriting that user's record.
+  const isEdit=n_(payload.editSheetRow)>=2;
+  let pdrNo=s_(payload.pdrNo);
+  if(!pdrNo || (!isEdit && valueExistsInColumn_(sh,1,pdrNo))) pdrNo=nextPDRNo_();
+  const product=s_(payload.product);
+  const code=s_(payload.internalCode);
+  if(!product)throw new Error('Product Name is required.');
+  if(!code)throw new Error('Internal Code is required.');
+  if(!s_(payload.category))throw new Error('Select Category.');
+  if(!s_(payload.concern))throw new Error('Select or enter Concern / Problem.');
+
+  const existing=pdrRows_().find(x=>x.pdrNo===pdrNo);
+  const createdStamp=existing ? sh.getRange(existing.sheetRow,2).getValue() : new Date();
+  const row=[
+    pdrNo,
+    createdStamp,
+    s_(payload.referenceType),
+    s_(payload.referenceNo),
+    s_(payload.area),
+    payload.productReceivedDate?dateObj_(payload.productReceivedDate):'',
+    s_(payload.category),
+    s_(payload.concern),
+    product,
+    code,
+    s_(payload.batchNo),
+    payload.expirationDate?dateObj_(payload.expirationDate):'',
+    n_(payload.inputQty),
+    n_(payload.outputQty),
+    s_(payload.initialDisposition),
+    s_(payload.finalDisposition),
+    n_(payload.finalQty),
+    s_(payload.remarks),
+    (s_(payload.status)||'OPEN').toUpperCase(),
+    s_(payload.createdBy),
+    new Date()
+  ];
+  if(existing)sh.getRange(existing.sheetRow,1,1,21).setValues([row]);
+  else sh.appendRow(row);
+  try{ linkFgReturnToPDR_(s_(payload.referenceNo), pdrNo); }catch(_){}
+  SpreadsheetApp.flush();
+
+  return {
+    ok:true,
+    pdrNo:pdrNo,
+    nextPDRNo:nextPDRNo_()
+  };
+}
+function savePDR_(payload){return withWriteLock_(function(){return savePDRCore_(payload);});}
+
+function getPDRPrintData_(pdrNo){
+  const x=getPDRRecord_(pdrNo);
+  return Object.assign({},x,{
+    documentNo:'VGCI-FM-QC-011',
+    revisionNo:'00',
+    pageNo:'1 of 1',
+    effectiveDate:'July 23, 2024',
+    dispositionCodes:[
+      'A - Rework','B - Return to Supplier','C - Gate Sale','D - Fish Meal',
+      'E - QA Sample','F - R&D Sample','G - Back to Stock','H - Disposal','I - Free Bread'
+    ]
+  });
+}
+
+function getProductCodeTraceability_(product,internalCode){
+  const d=getProductTraceability_(product);
+  const codeKey=normTrace_(internalCode);
+  const batches=(d.batches||[]).filter(b=>normTrace_(b.internalCode)===codeKey);
+
+  // Current inventory balance for the exact Product + Internal Code.
+  let currentQty=0;
+  try{
+    inventoryRows_().forEach(x=>{
+      if(normTrace_(x.item)===normTrace_(product) && normTrace_(x.internalCode)===codeKey){
+        currentQty+=n_(x.qtyOnHand);
+      }
+    });
+  }catch(_){}
+
+  let totalTransmitted=0,totalReceived=0,totalPass=0,totalHold=0,totalAllocated=0;
+  batches.forEach(b=>{
+    (b.transmittals||[]).forEach(x=>totalTransmitted+=n_(x.qty));
+    (b.receiving||[]).forEach(x=>totalReceived+=n_(x.qtyReceived));
+    (b.metalDetection||[]).forEach(x=>{
+      totalPass+=n_(x.qtyPass);
+      totalHold+=n_(x.qtyHold);
+    });
+    (b.allocations||[]).forEach(x=>totalAllocated+=n_(x.qtyAllocated));
+  });
+
+  const webAppUrl=ScriptApp.getService().getUrl()||'';
+  const traceUrl=webAppUrl
+    ? webAppUrl+'?page=traceability&traceProduct='+encodeURIComponent(s_(product))+'&traceCode='+encodeURIComponent(s_(internalCode))+'#traceability'
+    : 'VGCI TRACEABILITY | '+s_(product)+' | '+s_(internalCode);
+
+  const pi=productInfo_(product);
+  const invBatch=inventoryRows_().find(x=>holdingNorm_(x.item)===holdingNorm_(product) && holdingNorm_(x.internalCode)===holdingNorm_(internalCode));
+  let productionDate='';
+  const allProdDates=[];
+  batches.forEach(b=>(b.transmittals||[]).forEach(x=>{
+    const raw=x.dateTime||x.date;
+    if(raw)allProdDates.push(raw);
+  }));
+  if(allProdDates.length){
+    productionDate=s_(allProdDates[0]).split(' ')[0];
+  }
+
+  let traceStatus='NO STOCK';
+  if(currentQty>0)traceStatus='ON HAND';
+  else if(totalAllocated>0 && totalAllocated>=totalPass)traceStatus='FULLY ALLOCATED';
+  else if(totalPass>0)traceStatus='RELEASED';
+
+  const exactIsLapsed=invBatch && String(invBatch.htStatus||'').startsWith('LAPSED');
+  if(currentQty>0 && exactIsLapsed)traceStatus='LAPSED - PHYSICAL STOCK ON HOLD';
+
+  return {
+    product:s_(product),
+    internalCode:s_(internalCode),
+    traceUrl:traceUrl,
+    generatedAt:Utilities.formatDate(new Date(),FG_CFG.TZ,'dd-MMM-yyyy hh:mm a'),
+    asOfDate:Utilities.formatDate(new Date(),FG_CFG.TZ,'dd-MMM-yyyy'),
+    productionDate:productionDate,
+    productMeta:{
+      marketType:pi.marketType||'',
+      category:pi.category||'',
+      unit:pi.unit||'',
+      shelfLifeDays:n_(pi.shelfLifeDays),
+      productionArea:pi.productionArea||''
+    },
+    traceStatus:traceStatus,
+    holding:{
+      holdingTimeDays:invBatch?invBatch.holdingTimeDays:holdingTimeInfo_(product).days,
+      lastValidDate:invBatch?invBatch.lastValidDate:'',
+      lapseDate:invBatch?invBatch.lapseDate:'',
+      htStatus:invBatch?invBatch.htStatus:(holdingTimeInfo_(product).days?'AVAILABLE':'NO HT SET'),
+      qualityDecision:invBatch?invBatch.qualityDecision:'',
+      qualityRemarks:invBatch?invBatch.qualityRemarks:'',
+      qualityDecisionDateTime:invBatch?invBatch.qualityDecisionDateTime:'',
+      productionDate:invBatch?invBatch.productionDate:productionDate,
+      qtyLapsed:invBatch && String(invBatch.htStatus||'').startsWith('LAPSED') ? invBatch.qtyOnHand : 0,
+      unit:'PACK'
+    },
+    summary:{
+      totalTransmitted,
+      totalReceived,
+      totalPass,
+      totalHold,
+      totalAllocated,
+      currentQty,
+      physicalQty:currentQty,
+      availableQty:(invBatch && String(invBatch.htStatus||'').startsWith('LAPSED')) ? 0 : currentQty,
+      lapsedQty:(invBatch && String(invBatch.htStatus||'').startsWith('LAPSED')) ? currentQty : 0
+    },
+    batches
+  };
+}
+
+function getProductTraceability_(product){
+  const item=s_(product).replace(/\s+/g,' ').trim();
+  if(!item)throw new Error('Select a product.');
+  const key=normTrace_(item);
+
+  const trRows=traceSheetRows_(FG_CFG.SHEETS.TRANSMITTAL,14);
+  const recvRows=traceSheetRows_(FG_CFG.SHEETS.RECEIVING,13);
+
+  let metals=[];
+  try{
+    metals=metalMonitoringRows_().filter(x=>normTrace_(x.product)===key);
+  }catch(_){}
+
+  let pdrs=[];
+  try{
+    pdrs=pdrRows_().filter(x=>normTrace_(x.product)===key);
+  }catch(_){}
+
+  let reallocations=[];
+  try{
+    reallocations=getReallocationHistory_().filter(x=>normTrace_(x.product)===key);
+  }catch(_){}
+
+  let allocations=[];
+  const aSh=ss_().getSheetByName(FG_CFG.SHEETS.ALLOCATION);
+  if(aSh && aSh.getLastRow()>=2){
+    const width=Math.min(14,aSh.getLastColumn());
+    allocations=aSh.getRange(2,1,aSh.getLastRow()-1,width).getValues().map(r=>({
+      date:dateText_(r[0]),
+      dateTime:dateTimeText_(r[0]),
+      allocationNo:s_(r[1]),
+      marketType:s_(r[2]),
+      customer:s_(r[3]),
+      product:s_(r[4]),
+      internalCode:s_(r[5]),
+      qtyBefore:n_(r[6]),
+      qtyAllocated:n_(r[7]),
+      balance:n_(r[8]),
+      allocatedBy:s_(r[10]),
+      remarks:s_(r[11]),
+      deliveryDate:dateText_(r[12])
+    })).filter(x=>normTrace_(x.product)===key);
+  }
+
+  const byCode={};
+  function batch(code){
+    const raw=s_(code).replace(/\s+/g,' ').trim()||'(NO CODE)';
+    const k=normTrace_(raw);
+    if(!byCode[k])byCode[k]={
+      internalCode:raw,
+      transmittals:[],
+      receiving:[],
+      metalDetection:[],
+      dispositions:[],
+      allocations:[],
+      reallocations:[]
+    };
+    return byCode[k];
+  }
+
+  trRows.filter(r=>normTrace_(r[3])===key).forEach(r=>{
+    batch(r[4]).transmittals.push({
+      date:dateText_(r[0]),
+      dateTime:dateTimeText_(r[0]),
+      transferNo:s_(r[1]),
+      from:s_(r[2]),
+      qty:n_(r[5]),
+      unit:s_(r[6]),
+      productionDate:dateText_(r[7]),
+      transferredBy:s_(r[8]),
+      status:s_(r[10]),
+      marketType:s_(r[12]),
+      customer:s_(r[13]),
+      remarks:s_(r[11])
+    });
+  });
+
+  recvRows.filter(r=>normTrace_(r[3])===key).forEach(r=>{
+    batch(r[4]).receiving.push({
+      date:dateText_(r[0]),
+      dateTime:dateTimeText_(r[0]),
+      transferNo:s_(r[1]),
+      qtyTransferred:n_(r[5]),
+      qtyReceived:n_(r[6]),
+      unit:s_(r[7]),
+      metalStatus:s_(r[8]),
+      receivingStatus:s_(r[9]),
+      receivedBy:s_(r[10]),
+      notedBy:s_(r[12]),
+      remarks:s_(r[11])
+    });
+  });
+
+  metals.forEach(x=>{
+    batch(x.internalCode).metalDetection.push({
+      monitoringNo:x.monitoringNo,
+      date:x.date,
+      dateTime:x.dateTime||x.date,
+      transferNo:x.transferNo,
+      qtyReceived:x.qtyReceived,
+      qtyPass:x.qtyPass,
+      qtyHold:x.qtyHold,
+      ferrous:x.ferrous,
+      nonFerrous:x.nonFerrous,
+      stainless:x.stainless,
+      result:x.finalResult,
+      timeStarted:x.timeStarted,
+      timeFinished:x.timeFinished,
+      assignedPersonnel:x.assignedPersonnel,
+      verifiedBy:x.verifiedBy,
+      remarks:x.remarks
+    });
+  });
+
+  pdrs.forEach(x=>batch(x.internalCode).dispositions.push({
+    pdrNo:x.pdrNo,date:x.date,dateTime:x.dateTime||x.date,referenceType:x.referenceType,referenceNo:x.referenceNo,
+    category:x.category,concern:x.concern,inputQty:x.inputQty,outputQty:x.outputQty,
+    initialDisposition:x.initialDisposition,finalDisposition:x.finalDisposition,
+    finalQty:x.finalQty,status:x.status,createdBy:x.createdBy,remarks:x.remarks
+  }));
+
+  allocations.forEach(x=>batch(x.internalCode).allocations.push(x));
+  reallocations.forEach(x=>batch(x.internalCode).reallocations.push(x));
+
+  const batches=Object.values(byCode)
+    .filter(b=>
+      b.transmittals.length ||
+      b.receiving.length ||
+      b.metalDetection.length ||
+      b.dispositions.length ||
+      b.allocations.length ||
+      b.reallocations.length
+    )
+    .sort((a,b)=>a.internalCode.localeCompare(b.internalCode));
+
+  return {
+    product:item,
+    generatedAt:Utilities.formatDate(new Date(),FG_CFG.TZ,'dd-MMM-yyyy hh:mm a'),
+    batches:batches
+  };
+}
+
+
+/* ==================== V135 LOCKED PUBLIC SAVE ENTRY POINTS ====================
+   The browser calls these names. Each one runs its *Core_ function inside the
+   script lock so two users can never write at the same moment.
+============================================================================== */
+function saveTransfer_(payload){return withWriteLock_(function(){return saveTransferCore_(payload);});}
+function receiveTransfer_(payload){return withWriteLock_(function(){return receiveTransferCore_(payload);});}
+function saveLapsedQADecision_(payload){return withWriteLock_(function(){return saveLapsedQADecisionCore_(payload);});}
+function savePersonnel_(payload){return withWriteLock_(function(){return savePersonnelCore_(payload);});}
+function saveCustomer_(payload){return withWriteLock_(function(){return saveCustomerCore_(payload);});}
+function saveUserAccess_(payload,adminUsername,adminPin){return withWriteLock_(function(){return saveUserAccessCore_(payload,adminUsername,adminPin);});}
+function saveInstitutionalCustomer_(payload){return withWriteLock_(function(){return saveInstitutionalCustomerCore_(payload);});}
+function saveMetalDetectorIncident_(payload){return withWriteLock_(function(){return saveMetalDetectorIncidentCore_(payload);});}
+function editInventoryBatch_(payload){return withWriteLock_(function(){return editInventoryBatchCore_(payload);});}
+function saveMetalDetectionPage2_(payload){return withWriteLock_(function(){return saveMetalDetectionPage2Core_(payload);});}
+function saveMetalMonitoringBatch_(payload){return withWriteLock_(function(){return saveMetalMonitoringBatchCore_(payload);});}
+
+
+/* ==================== V137 DAILY BACKUP (no Google Drive permission needed) ====================
+   The inventory day runs 7:00 AM to 7:00 AM. Example: ending inventory of Oct 4 is
+   taken at 7:00 AM of Oct 5, which is also the start of Oct 5's inventory.
+
+   ONE-TIME SETUP (owner account, in the Apps Script editor):
+     1. Select function  setupDailyBackup  in the toolbar.
+     2. Click Run and approve (only Sheets + "run when you are not present").
+   Result: every day at 7:00 AM, all sheets are copied (as values) into the
+   backup file for the inventory day that just ended:
+       "VGCI FG Inventory Backup - Sun (Ending 2026-10-04)" ... one file per weekday
+   = 7 days of end-of-day snapshots; each file is overwritten one week later.
+   Run listBackupFiles to print their links in the Execution log.
+=============================================================================================== */
+const FG_INVENTORY_CUTOFF_HOUR = 7;   // inventory day ends / next day starts at 7:00 AM
+
+function setupDailyBackup(){
+  ScriptApp.getProjectTriggers().forEach(t=>{
+    if(t.getHandlerFunction()==='runDailyBackup') ScriptApp.deleteTrigger(t);
+  });
+  // Safety net: a normal daily run between 7-8 AM (skipped if the exact 7:00 run already backed up).
+  ScriptApp.newTrigger('runDailyBackup').timeBased().everyDays(1).atHour(FG_INVENTORY_CUTOFF_HOUR).nearMinute(30).inTimezone(FG_CFG.TZ).create();
+  // Exact 7:00 AM run (re-schedules itself every day).
+  scheduleNextBackup_();
+  // Test backup now (labelled as a manual mid-day backup).
+  PropertiesService.getScriptProperties().deleteProperty('FG_LAST_BACKUP');
+  const r = backupNow_(true);
+  Logger.log('Daily backup is ON: every day at 7:00 AM (end of previous day inventory). Test backup: ' + r);
+  return r;
+}
+
+/** One-time trigger for the next 7:00:00 AM Manila time. */
+function scheduleNextBackup_(){
+  ScriptApp.getProjectTriggers().forEach(t=>{
+    if(t.getHandlerFunction()==='runExactBackup') ScriptApp.deleteTrigger(t);
+  });
+  const now = new Date();
+  const hh = ('0'+FG_INVENTORY_CUTOFF_HOUR).slice(-2);
+  let next = new Date(Utilities.formatDate(now, FG_CFG.TZ, 'yyyy-MM-dd') + 'T' + hh + ':00:00+08:00');
+  if(next.getTime() <= now.getTime() + 60000) next = new Date(next.getTime() + 86400000);
+  ScriptApp.newTrigger('runExactBackup').timeBased().at(next).create();
+  return next;
+}
+
+/** Fired by the exact 7:00 AM trigger. Always schedules tomorrow, even if the backup fails. */
+function runExactBackup(){
+  try { return runDailyBackup(); }
+  finally { scheduleNextBackup_(); }
+}
+
+/** Fired by the 7-8 AM safety-net trigger (and by runExactBackup). */
+function runDailyBackup(){
+  const lastAt = n_(PropertiesService.getScriptProperties().getProperty('FG_LAST_BACKUP'));
+  if(Date.now() - lastAt < 12*3600000) return 'Skipped: today\'s 7:00 AM backup is already done.';
+  return backupNow_(false);
+}
+
+/** The inventory day that just ENDED (7:00 AM Oct 5 -> "2026-10-04"). Tolerates the trigger firing up to 30 min early. */
+function endedInventoryDate_(){
+  const t = Date.now() - FG_INVENTORY_CUTOFF_HOUR*3600000 + 30*60000 - 86400000;
+  return new Date(t);
+}
+
+function backupNow_(manual){
+  const props = PropertiesService.getScriptProperties();
+  const src = ss_();
+  const ended = endedInventoryDate_();
+  const endedText = Utilities.formatDate(ended, FG_CFG.TZ, 'yyyy-MM-dd (EEE)');
+  // File per weekday of the inventory day that ended (Oct 4 = Sun file).
+  const day = manual ? 'Manual' : Utilities.formatDate(ended, FG_CFG.TZ, 'EEE');
+  const key = 'FG_BACKUP_ID_' + day;
+  let bk = null;
+  const id = props.getProperty(key);
+  if(id){ try{ bk = SpreadsheetApp.openById(id); }catch(_){ bk = null; } }
+  if(!bk){
+    bk = SpreadsheetApp.create('VGCI FG Inventory Backup - ' + day);
+    props.setProperty(key, bk.getId());
+  }
+
+  // Clear the old copy (a spreadsheet must always keep one sheet).
+  const temp = bk.insertSheet('_tmp_' + Date.now());
+  bk.getSheets().forEach(sh=>{ if(sh.getSheetId()!==temp.getSheetId()) bk.deleteSheet(sh); });
+
+  // Copy every sheet as plain values into a fresh sheet (no formulas, merges or
+  // pivot tables to break). One problem sheet does not stop the whole backup.
+  const report = [];
+  src.getSheets().forEach(sh=>{
+    const name = sh.getName();
+    try{
+      const lr = sh.getLastRow(), lc = sh.getLastColumn();
+      const dst = bk.insertSheet(name);
+      if(lr>0 && lc>0){
+        if(dst.getMaxRows() < lr) dst.insertRowsAfter(dst.getMaxRows(), lr - dst.getMaxRows());
+        if(dst.getMaxColumns() < lc) dst.insertColumnsAfter(dst.getMaxColumns(), lc - dst.getMaxColumns());
+        // Batch size depends on the number of columns (about 20,000 cells per write).
+        const CHUNK = Math.max(1, Math.floor(20000 / lc));
+        for(let r=1; r<=lr; r+=CHUNK){
+          backupCopyBlock_(sh, dst, r, Math.min(CHUNK, lr - r + 1), lc);
+        }
+        dst.setFrozenRows(Math.min(1, lr));
+      }
+      report.push([name, lr + ' rows x ' + lc + ' cols', 'OK']);
+    }catch(e){
+      report.push([name, '', 'FAILED: ' + String(e && e.message || e)]);
+    }
+  });
+  const info = bk.insertSheet('_Backup Info', 0);
+  const head = [
+    ['Backup of', src.getName(), ''],
+    ['Ending Inventory of', manual ? 'MANUAL / TEST BACKUP (taken mid-day, not an end-of-day snapshot)' : endedText + '  (snapshot at 7:00 AM cut-off)', ''],
+    ['Backup date/time', Utilities.formatDate(new Date(), FG_CFG.TZ, 'yyyy-MM-dd HH:mm:ss'), ''],
+    ['Source file ID', src.getId(), ''],
+    ['', '', ''],
+    ['Sheet', 'Size', 'Result']
+  ];
+  info.getRange(1,1,head.length + report.length,3).setValues(head.concat(report));
+  bk.deleteSheet(temp);
+  const failed = report.filter(r => String(r[2]).indexOf('FAILED') === 0);
+  if(failed.length) Logger.log('Some sheets could not be backed up: ' + failed.map(r => r[0] + ' (' + r[2] + ')').join('; '));
+
+  if(!manual) props.setProperty('FG_LAST_BACKUP', String(Date.now()));
+  try{ bk.rename('VGCI FG Inventory Backup - ' + day + (manual ? '' : ' (Ending ' + Utilities.formatDate(ended, FG_CFG.TZ, 'yyyy-MM-dd') + ')')); }catch(_){}
+  return bk.getName() + ' -> ' + bk.getUrl();
+}
+
+/** Copies a block of rows; if Google rejects it, splits it smaller. A single row
+    that still fails is saved as plain text (and cut to 50,000 characters per cell). */
+function backupCopyBlock_(src, dst, row, rows, cols){
+  try{
+    dst.getRange(row,1,rows,cols).setValues(src.getRange(row,1,rows,cols).getValues());
+  }catch(e){
+    if(rows > 1){
+      const half = Math.floor(rows / 2);
+      backupCopyBlock_(src, dst, row, half, cols);
+      backupCopyBlock_(src, dst, row + half, rows - half, cols);
+    }else{
+      const txt = src.getRange(row,1,1,cols).getDisplayValues()[0].map(v => String(v).slice(0,50000));
+      dst.getRange(row,1,1,cols).setNumberFormat('@').setValues([txt]);
+    }
+  }
+}
+
+/** Run from the editor to print the 7 backup file links in the Execution log. */
+function listBackupFiles(){
+  const props = PropertiesService.getScriptProperties();
+  ['Mon','Tue','Wed','Thu','Fri','Sat','Sun','Manual'].forEach(d=>{
+    const id = props.getProperty('FG_BACKUP_ID_' + d);
+    Logger.log(d + ': ' + (id ? 'https://docs.google.com/spreadsheets/d/' + id : '(not created yet)'));
+  });
+}
+
+
+/* ==================== V137 DUPLICATE NUMBER CHECKER ====================
+   Admin / User Access -> "Check Duplicate Numbers".
+   Finds reference numbers used by more than one separate save (mostly from
+   before V135), and writes the list to the "Duplicate Check" sheet.
+========================================================================= */
+function dupScan_(sheetName, label, numCol, saveKeyFn){
+  const sh = ss_().getSheetByName(sheetName);
+  if(!sh || sh.getLastRow()<2) return [];
+  const vals = sh.getRange(2,1,sh.getLastRow()-1,sh.getLastColumn()).getValues();
+  const map = {};
+  vals.forEach((r,i)=>{
+    const no = s_(r[numCol-1]); if(!no) return;
+    if(!map[no]) map[no] = {saves:{}, rows:[]};
+    map[no].saves[saveKeyFn ? saveKeyFn(r) : ('row'+i)] = 1;
+    map[no].rows.push(i+2);
+  });
+  return Object.keys(map).filter(no=>Object.keys(map[no].saves).length>1).map(no=>({
+    type:label, number:no, sheet:sheetName, saves:Object.keys(map[no].saves).length,
+    rows:map[no].rows.join(', ')
+  }));
+}
+
+function runDuplicateCheck_(){
+  const t = v => v instanceof Date ? v.getTime() : s_(v);
+  const S = FG_CFG.SHEETS;
+  let out = [];
+  // V140: re-transmitted lines (column O = Return No.) legitimately reuse the TR number.
+  out = out.concat(dupScan_(S.TRANSMITTAL, 'Transfer No. (TR) saved more than once', 2, r=>s_(r[14]) ? 'RETURN' : t(r[0])+'|'+s_(r[8])));
+  out = out.concat(dupScan_(S.RECEIVING,   'Transfer line received more than once',   2, r=>n_(r[13]) ? 'LINE'+n_(r[13])+'|'+t(r[0]) : t(r[0])+'|'+s_(r[10])));
+  out = out.concat(dupScan_(S.ALLOCATION,  'Allocation No. (AL)',                     2, null));
+  out = out.concat(dupScan_('Reallocation','Reallocation No. (RA)',                   2, null));
+  out = out.concat(dupScan_(S.METAL_MONITORING,'Metal Monitoring No. (MD)',           1, r=>s_(r[7])+'|'+s_(r[11])+'|'+s_(r[13])));
+  out = out.concat(dupScan_(S.METAL,       'Metal Incident No.',                      1, null));
+  out = out.concat(dupScan_(S.PDR,         'PDR No.',                                 1, null));
+
+  let sh = ss_().getSheetByName('Duplicate Check');
+  if(!sh) sh = ss_().insertSheet('Duplicate Check');
+  sh.clearContents();
+  sh.getRange(1,1,1,5).setValues([['Check Type','Reference No.','Sheet','Separate Saves','Sheet Rows']]);
+  sh.getRange(1,1,1,6).setValues([['Check Type','Reference No.','Sheet','Separate Saves','Sheet Rows','Checked At']]);
+  if(out.length) sh.getRange(2,1,out.length,6).setValues(out.map(x=>[x.type,x.number,x.sheet,x.saves,x.rows,new Date()]));
+  else sh.getRange(2,1,1,6).setValues([['No duplicates found','','','','',new Date()]]);
+  sh.setFrozenRows(1);
+  return {ok:true, count:out.length, items:out, checkedAt:Utilities.formatDate(new Date(),FG_CFG.TZ,'dd-MMM-yyyy hh:mm a')};
+}
+
+
+/* ==================== V138 PRODUCT MASTER (Add / Edit / Deactivate) ====================
+   Page "Product Master" - JPC (ADMIN) and CBP (MANAGER) only.
+   One save updates, together:
+     - Product Master       (B name, C market type, D category, F shelf life, G area, H active;
+                             A and E are shown with their own sheet header names)
+     - Holding Time Master  (holding time days for this product)
+     - Customer Products    (Institutional customers that take this product: YES / NO)
+     - Supermarket Products (Supermarket customers that take this product: ACTIVE / INACTIVE)
+   Products are never deleted (traceability); set Status = INACTIVE instead.
+   Renaming is blocked: history (transfers, inventory, PDR) is stored by product name.
+======================================================================================== */
+function productMasterSheet_(){
+  const sh = sheet_(FG_CFG.SHEETS.PRODUCTS);
+  ensureColumns_(sh, 8);
+  return sh;
+}
+
+function supermarketSheet_(){
+  let sh = ss_().getSheetByName(FG_CFG.SHEETS.SUPERMARKET_PRODUCTS);
+  if(!sh){
+    sh = ss_().insertSheet(FG_CFG.SHEETS.SUPERMARKET_PRODUCTS);
+    sh.getRange(1,1,1,3).setValues([['Customer','Product','Status']]);
+    sh.setFrozenRows(1);
+  }
+  return sh;
+}
+
+function getProductAdminData_(){
+  const pm = productMasterSheet_();
+  const headers = pm.getRange(1,1,1,8).getDisplayValues()[0].map(s_);
+  const pmRows = pm.getLastRow()<2 ? [] : pm.getRange(2,1,pm.getLastRow()-1,8).getValues();
+
+  // Holding time (exact product-name rows only)
+  const ht = ensureHoldingTimeMaster_();
+  const htRows = ht.getLastRow()<2 ? [] : ht.getRange(2,1,ht.getLastRow()-1,6).getValues();
+  const htFor = name => {
+    const k = holdingNorm_(name);
+    const hit = htRows.find(r => holdingNorm_(r[0])===k && !s_(r[1]) && s_(r[5]).toUpperCase()!=='INACTIVE')
+             || htRows.find(r => holdingNorm_(r[0])===k && s_(r[5]).toUpperCase()!=='INACTIVE');
+    return hit ? n_(hit[2]) : '';
+  };
+
+  // Customer assignments
+  const cp = sheet_(FG_CFG.SHEETS.CUSTOMER_PRODUCTS);
+  const cpRows = cp.getLastRow()<2 ? [] : cp.getRange(2,1,cp.getLastRow()-1,Math.max(4,cp.getLastColumn())).getValues();
+  const sm = supermarketSheet_();
+  const smRows = sm.getLastRow()<2 ? [] : sm.getRange(2,1,sm.getLastRow()-1,Math.max(3,sm.getLastColumn())).getValues();
+  const instMap = {}, smMap = {}, instCust = {}, smCust = {};
+  cpRows.forEach(r=>{
+    const c=s_(r[0]), p=s_(r[1]); if(!c) return; instCust[c]=1;
+    if(p && s_(r[3]).toUpperCase()!=='NO'){ (instMap[p.toUpperCase()] = instMap[p.toUpperCase()] || []).push(c); }
+  });
+  smRows.forEach(r=>{
+    const c=s_(r[0]), p=s_(r[1]), st=s_(r[2]).toUpperCase(); if(!c) return; smCust[c]=1;
+    if(p && (!st || st==='ACTIVE' || st==='YES')){ (smMap[p.toUpperCase()] = smMap[p.toUpperCase()] || []).push(c); }
+  });
+  customerMasterRows_().forEach(x=>{
+    if(!x.customer || x.status==='INACTIVE') return;
+    if(x.marketType==='SUPERMARKET') smCust[x.customer]=1; else instCust[x.customer]=1;
+  });
+
+  const distinct = idx => [...new Set(pmRows.map(r=>s_(r[idx])).filter(Boolean))].sort();
+  const products = pmRows.map((r,i)=>({
+    sheetRow:i+2, colA:s_(r[0]), item:s_(r[1]), marketType:s_(r[2]), category:s_(r[3]), colE:s_(r[4]),
+    shelfLifeDays:r[5]===''?'':n_(r[5]), productionArea:s_(r[6]),
+    status: s_(r[7]).toUpperCase()==='NO' ? 'INACTIVE' : 'ACTIVE',
+    holdingTimeDays: htFor(r[1]),
+    institutionalCustomers: instMap[s_(r[1]).toUpperCase()] || [],
+    supermarketCustomers: smMap[s_(r[1]).toUpperCase()] || []
+  })).filter(p=>p.item).sort((a,b)=>a.item.localeCompare(b.item));
+
+  return {
+    headers: {a: headers[0] || 'Column A', e: headers[4] || 'Column E'},
+    products: products,
+    marketTypes: [...new Set(['INSTITUTIONAL','SUPERMARKET'].concat(distinct(2).map(x=>x.toUpperCase())))],
+    categories: distinct(3), areas: [...new Set(['B1','B2'].concat(distinct(6)))].sort(),
+    institutionalCustomers: Object.keys(instCust).sort(),
+    supermarketCustomers: Object.keys(smCust).sort()
+  };
+}
+
+function saveProduct_(p){
+  p = p || {};
+  const item = s_(p.item).replace(/\s+/g,' ');
+  if(!item) throw new Error('Product Name is required.');
+  const market = s_(p.marketType).toUpperCase();
+  if(!market) throw new Error('Market Type is required.');
+  const status = s_(p.status).toUpperCase()==='INACTIVE' ? 'INACTIVE' : 'ACTIVE';
+  const shelf = s_(p.shelfLifeDays)==='' ? '' : n_(p.shelfLifeDays);
+  if(shelf!=='' && shelf<0) throw new Error('Shelf Life cannot be negative.');
+  const htDays = s_(p.holdingTimeDays)==='' ? '' : n_(p.holdingTimeDays);
+  if(htDays!=='' && htDays<=0) throw new Error('Holding Time must be at least 1 day (or leave blank).');
+  const area = s_(p.productionArea).toUpperCase();
+  const inst = (Array.isArray(p.institutionalCustomers)?p.institutionalCustomers:[]).map(s_).filter(Boolean);
+  const smc  = (Array.isArray(p.supermarketCustomers)?p.supermarketCustomers:[]).map(s_).filter(Boolean);
+  const by = FG_SESSION_ ? FG_SESSION_.username : '';
+
+  const pm = productMasterSheet_();
+  const rows = pm.getLastRow()<2 ? [] : pm.getRange(2,1,pm.getLastRow()-1,8).getValues();
+  const editRow = n_(p.sheetRow);
+  const dup = rows.findIndex((r,i)=> s_(r[1]).toUpperCase()===item.toUpperCase() && (i+2)!==editRow);
+  if(dup>=0) throw new Error('"'+item+'" already exists in Product Master (row '+(dup+2)+'). Use Edit instead.');
+
+  let mode = 'added';
+  if(editRow){
+    if(editRow<2 || editRow>pm.getLastRow()) throw new Error('This product row no longer exists. Please refresh.');
+    const old = rows[editRow-2];
+    if(s_(old[1]).toUpperCase()!==item.toUpperCase())
+      throw new Error('Renaming is not allowed because transfers, inventory and PDR records use the product name. Set the old product to INACTIVE and add the new name instead.');
+    pm.getRange(editRow,1,1,8).setValues([[s_(p.colA), s_(old[1]), market, s_(p.category), s_(p.colE), shelf, area, status==='ACTIVE'?'YES':'NO']]);
+    mode = 'updated';
+  }else{
+    pm.getRange(pm.getLastRow()+1,1,1,8).setValues([[s_(p.colA), item, market, s_(p.category), s_(p.colE), shelf, area, status==='ACTIVE'?'YES':'NO']]);
+  }
+
+  // Holding Time Master: one exact row per product (no size/variant)
+  if(htDays!==''){
+    const ht = ensureHoldingTimeMaster_();
+    const hr = ht.getLastRow()<2 ? [] : ht.getRange(2,1,ht.getLastRow()-1,6).getValues();
+    const k = holdingNorm_(item);
+    const idx = hr.findIndex(r=>holdingNorm_(r[0])===k && !s_(r[1]));
+    const row = [item, '', htDays, htDays+(htDays===1?' day':' days'), area, 'ACTIVE'];
+    if(idx>=0) ht.getRange(idx+2,1,1,6).setValues([row]);
+    else ht.getRange(ht.getLastRow()+1,1,1,6).setValues([row]);
+  }
+
+  // Institutional customers (Customer Products: A customer, B product, D active YES/NO)
+  const cp = sheet_(FG_CFG.SHEETS.CUSTOMER_PRODUCTS); ensureColumns_(cp,4);
+  const cpRows = cp.getLastRow()<2 ? [] : cp.getRange(2,1,cp.getLastRow()-1,4).getValues();
+  const want = {}; inst.forEach(c=>want[c.toUpperCase()]=c);
+  cpRows.forEach((r,i)=>{
+    if(s_(r[1]).toUpperCase()!==item.toUpperCase()) return;
+    const ck = s_(r[0]).toUpperCase();
+    const should = want[ck] ? 'YES' : 'NO';
+    if(s_(r[3]).toUpperCase()!==should) cp.getRange(i+2,4).setValue(should);
+    delete want[ck];
+  });
+  Object.values(want).forEach(c=>cp.getRange(cp.getLastRow()+1,1,1,4).setValues([[c, item, '', 'YES']]));
+
+  // Supermarket customers (Supermarket Products: A customer, B product, C ACTIVE/INACTIVE)
+  const sm = supermarketSheet_();
+  const smRows = sm.getLastRow()<2 ? [] : sm.getRange(2,1,sm.getLastRow()-1,3).getValues();
+  const wantS = {}; smc.forEach(c=>wantS[c.toUpperCase()]=c);
+  smRows.forEach((r,i)=>{
+    if(s_(r[1]).toUpperCase()!==item.toUpperCase()) return;
+    const ck = s_(r[0]).toUpperCase();
+    const should = wantS[ck] ? 'ACTIVE' : 'INACTIVE';
+    const cur = s_(r[2]).toUpperCase();
+    const curActive = !cur || cur==='ACTIVE' || cur==='YES';
+    if(curActive !== (should==='ACTIVE')) sm.getRange(i+2,3).setValue(should);
+    delete wantS[ck];
+  });
+  Object.values(wantS).forEach(c=>sm.getRange(sm.getLastRow()+1,1,1,3).setValues([[c, item, 'ACTIVE']]));
+
+  logTxn_({type:'PRODUCT MASTER '+mode.toUpperCase(), ref:'PRODUCT', marketType:market, customer:'', item:item,
+    internalCode:'', qtyIn:0, qtyOut:0, user:by,
+    remarks:'Status '+status+' | HT '+(htDays===''?'-':htDays+'d')+' | Inst: '+(inst.join(', ')||'-')+' | SM: '+(smc.join(', ')||'-')});
+
+  return {ok:true, mode:mode, item:item, data:getProductAdminData_()};
+}
+
+
+/* ==================== V139 ONE-TIME SUPERMARKET IMPORT (from OCTOBER 05-11 2026 FORECAST) ====================
+   Admin / Personnel page -> "Supermarket Import":
+     1. Preview  - matches every forecast bread to the EXACT name in your Product Master and writes the
+                   result to the "Supermarket Import" sheet. Nothing else is changed.
+     2. Apply    - adds the supermarkets to Customer Master (SUPERMARKET / ACTIVE) and the
+                   supermarket-bread pairs to Supermarket Products. Additive only: nothing is deleted
+                   or deactivated; running it twice does not create duplicates.
+   Breads that are AMBIGUOUS or NOT FOUND are skipped. To fix one, type the exact Product Master
+   name in column F ("Use this Product Master name") of the "Supermarket Import" sheet, then
+   Preview again.
+   Data below: [forecast bread, matching key] and [supermarket, [bread indexes], names in forecast].
+================================================================================================================ */
+const FG_SM_IMPORT_BREADS = [["Blueberry Bagel", "BLUEBERRY BAGELS"], ["Bread Sticks Seasoned", "SEASONED BREADSTICK"], ["Brioche Burger Bun", "BRIOCHE BURGER BUNS 4”"], ["Brioche Hotdog Bun", "BRIOCHE HOTDOG BUNS 6”"], ["Cinnamon Raisin Bagel", "CINNAMON RAISIN BAGELS"], ["Cinnamon Sugar Bread Fries", "CINNAMON SUGAR BREAD FRIES"], ["English Muffins", "ENGLISH MUFFINS"], ["Flour Tortilla 10\"", "TORTILLA - LARGE 10” N.F."], ["Flour Tortilla 6\"", "TORTILLA - SMALL 6” N.F."], ["Focaccia Herbed Onion", "FOCACCIA HERBED ONION"], ["Focaccia Wheat Rosemary Olives", "FOCACCIA WHOLE WHEAT ROSEMARY"], ["French Baguette", "FRENCH BAGUETTE 21”"], ["French Batard", "FRENCH BATARD"], ["Half Multi Grain Loaf", "MULTIGRAIN LOAF (360 grams)"], ["Half Rye Loaf", "RYE LOAF (400 grams)"], ["Mini French Baguette", "MINI-FRENCH BAGUETTE"], ["Plain Bagel", "PLAIN BAGELS"], ["Plain Pita Regular 5\" Pocket", "PLAIN PITA POCKET 5”"], ["Rosemary Olive Batard", "ROSEMARY OLIVE BATARD"], ["Sourdough Baguette", "SOURDOUGH BAGUETTE"], ["Sourdough Batard", "SOURDOUGH BATARD"], ["Sourdough WW Batard", "SOURDOUGH WHOLE WHEAT BATARD"], ["WW Tortilla 10\"", "WHEAT TORTILLA - LARGE 10”"], ["WW Tortilla 12\"", "WHOLE WHEAT TORTILLA 12”"], ["WW Tortilla 6\"", "WHEAT TORTILLA - SMALL 6”"], ["Whole Wheat Banana Bagel", "WHOLE WHEAT BANANA BAGELS"], ["Whole Wheat Pandesal", "WHOLE WHEAT PANDESAL"], ["Whole Wheat Pita", "WHOLE WHEAT PITA"]];
+const FG_SM_IMPORT_STORES = [["ROBINSONS MAGALLANES",[16,15,11,12,21,9,10,26,17,6,13,2,3,24,22,14,8,7],"ROBINSONS MAGALLANES"],["ROBINSONS MAKATI",[16,4,0,15,1,11,12,21,27,9,10,26,17,6,13,14,2,3,24,22,8,7],"ROBINSONS MAKATI / ROBINSONS MAKATI T MP"],["ROBINSONS ROCKWELL",[16,4,0,15,1,11,12,21,9,10,26,17,6,13,14,2,3,24,22,8,7],"ROBINSONS ROCKWELL"],["ROBINSONS SANTOLAN",[16,4,25,0,15,1,19,20,11,12,21,27,18,9,10,26,17,6,13,14,2,3,24,22,8,7],"ROBINSONS SANTOLAN"],["ROBINSONS SHANGRILA",[16,4,0,15,1,11,12,21,9,10,26,17,6,13,14,2,3,24,22,8,7],"ROBINSONS SHANGRILA"],["ROBINSONS PASEO MAKATI",[15,11,21,13,2,3,24,22,17,14,8,7,12,10],"ROBINSONS PASEO MAKATI"],["ROBINSONS MCKINLEY STANFORD",[4,15,11,21,9,26,17,2,24,6,8,7,10],"ROBINSONS MCKINLEY STANFORD"],["ROBINSONS P.GUEVARRA",[15,11,12,21,17,14,2,3,24,22,8,7,16],"ROBINSONS P.GUEVARRA"],["ROBINSONS ALPHALAND",[16,11,21,9,17,13,24,22,14,8,7,15,2,3],"ROBINSONS ALPHALAND"],["ROBINSONS CENTURY MAKATI",[16,15,11,12,21,26,17,6,13,2,3,24,8,7,10,14],"ROBINSONS CENTURY / ROBINSONS CENTURY MAKATI"],["RUSTANS GLOBAL CITY",[16,4,15,11,12,21,27,9,10,26,17,6,13,14,2,24,8,7],"ROBINSONS GLOBAL CITY / RUSTANS GLOBAL CITY"],["ROBINSONS UPTOWN BGC",[0,11,21,27,9,26,17,13,2,3,24,22,8,7],"ROBINSONS UPTOWN / ROBINSONS UPTOWN BGC"],["RUSTANS PARADIGM",[16,4,0,15,11,12,21,10,26,17,13,2,3,24,27,9,14],"ROBINSONS PARADIGM (Ayala 30th) / RUSTANS PARADIGM"],["ROBINSONS TWO CENTRAL",[16,11,12,9,13,2,24,22,17,14,8,7],"ROBINSONS TWO CENTRAL"],["ROBINSONS EASTBAY",[11,9,2,24,8,15,12,26],"ROBINSONS EASTBAY"],["ROBINSONS SAN LORENZO",[11,9,2,3,24,22,12,8,7,16],"ROBINSONS SAN LORENZO"],["ROBINSONS COMMONWEALTH DON MARIANO",[16,4,15,1,11,12,21,9,10,26,17,13,2,24,8,7,23],"ROBINSONS COMMONWEALTH DON MARIANO"],["ROBINSONS CIRCUIT MAKATI",[16,4,15,1,11,12,21,10,17,13,2,24,27,26,8,7,9],"ROBINSONS CIRCUIT MAKATI"],["ROBINSONS LANCASTER IMUS",[16,4,15,1,11,12,21,9,26,6,13,2,3,24,22,8,7,27,10,17],"ROBINSONS LANCASTER / ROBINSONS LANCASTER IMUS"],["ROBINSONS FESTIVAL SUPERMALL",[11,12,21,9,10,13,14,2,8,7,24,22,27,26,3],"ROBINSONS FESTIVAL MALL / ROBINSONS FESTIVAL SUPERMALL / SHOPWISE FESTIVAL SUPERMALL"],["UNIMART",[16,4,0,15,1,19,20,11,12,21,27,18,26,17,13,14,2,3,8,7],"UNIMART"],["UNIMART PASIG",[16,15,1,19,20,11,12,18,26,17,13,14,2,3,8,7],"UNIMART PASIG"],["THE LANDMARK CORPORATION",[16,4,25,0,1,19,20,11,12,21,27,18,9,10,26,17,6,13,14,2,3,24,22,8,7],"THE LANDMARK CORPORATION"],["THE LANDMARK CORPORATION - BGC",[16,4,25,0,1,19,20,11,12,21,27,18,9,10,26,17,6,13,14,2,3,24,22,8,7],"THE LANDMARK CORPORATION - BGC"],["CASH & CARRY",[16,0,15,1,27,9,10,26,17,6,13,14,2,3,24,8,7],"CASH & CARRY"],["MAKATI SUPERMARKET",[16,4,15,1,19,20,11,12,21,27,18,26,17,13,14,8,7,5],"MAKATI SUPERMARKET"],["EVER MASANGKAY",[25,1,19,11,12,21,9,24,15,10,26,8],"EVER MASANGKAY"],["EVER COMMONWEALTH",[25,15,1,19,11,12,21,9,26,24,10,8],"EVER COMMONWEALTH"],["MARKET MARKET",[16,4,15,19,20,11,12,21,18,9,10,26,17,6,0,1,27,8,7,25],"MARKET MARKET"],["MARKET MARKET ALABANG",[16,19,20,11,21,18,9,26,6,15,1,8,4,0],"MARKET MARKET ALABANG"],["METRO GAISANO FELIZ",[16,15,19,20,11,12,21,18,9,10,26,6,8,7,1],"METRO GAISANO FELIZ - TUES.& SAT"],["PIONEER SUPERMARKET",[4,25,0,15,1,19,20,11,12,21,18,9,10,26,17,6,24,22,8,7],"PIONEER SUPERMARKET"],["PUREGOLD TERRACES",[16,11,21,8,7,24,22],"PUREGOLD- TERRACES-Tues& Sat.only"],["PUREGOLD PC DAU",[16,4,19,11,21,18,9,6,24,22,25,15,8,7],"PUREGOLD PC DAU-Tues& Fri."],["PUREGOLD JR.-ANGELES (DON JUICO)",[16,19,11,21,18,9,6,24,22,4,25,8,7],"PUREGOLD JR.-ANGELES (DON JUICO)-Tues&Fri."],["ROBINSONS COMMONWEALTH",[16,4,15,19,11,21,9,26,13,24,12,8,25],"ROBINSONS COMMONWEALTH"],["ROBINSONS ERMITA",[16,4,15,1,20,11,12,21,27,18,9,10,26,6,13,2,24,22,14,8,7,0],"ROBINSON ERMITA"],["ROBINSONS GALLERIA",[16,15,19,20,11,21,18,9,10,26,6,13,2,3,24,12,8,7,0,27],"ROBINSON GALLERIA"],["ROBINSONS MAGNOLIA",[16,4,0,1,19,20,11,21,27,9,10,26,17,6,2,24,22,12,8,7],"ROBINSONS MAGNOLIA"],["ROBINSONS MCKINLEY",[16,0,1,19,20,11,12,21,18,9,10,26,17,6,13,2,3,24,22,15,14,8,7,27],"ROBINSONS MCKINLEY"],["ROBINSONS FORBES",[16,4,25,0,15,1,19,20,11,12,21,27,18,9,26,17,6,13,14,2,3,24,22,8,7,10],"ROBINSONS FORBES"],["ROBINSONS MADISON ALABANG",[16,4,1,19,11,21,27,9,26,6,2,3,24,22,15,12,8,7,17],"ROBINSONS MADISON ALABANG / ROBINSONS Madison Alabang"],["ROBINSONS METRO EAST",[16,0,1,19,20,11,21,18,9,26,13,2,3,24,22,15,12,10,14,8,7],"ROBINSON METRO EAST"],["ROBINSONS MARIKINA",[16,15,1,20,11,21,27,18,9,17,6,13,2,24,22,12,10,26,14,8,7],"ROBINSONS MARIKINA"],["ROBINSONS OTIS",[16,1,19,20,11,21,18,9,2,24,22,23,12,10,17,8,7,0,26],"ROBINSONS OTIS"],["ROBINSONS MERCEDES",[16,1,19,20,11,21,10,17,14,2,3,24,22,12,8,7,26,13],"ROBINSONS MERCEDES"],["ROBINSONS AYALA TRIANGLE GARDENS",[26,13,14,7,25],"ROBINSONS AYALA TRIANGLE GARDENS"],["STA. LUCIA SUPERMARKET",[15,19,11,26,17,13,14,24,22,1,8,7],"STA. LUCIA SUPERMARKET"],["ROBINSONS TMP MAGNOLIA",[16,4,25,1,19,20,11,12,21,27,10,6,13,2,3,24,22,15,9,26,17,14,8,7],"ROBINSONS TMP MAGNOLIA"],["ROBINSONS TMP VISTA ANTIPOLO",[16,4,25,15,1,19,20,11,21,27,9,10,26,17,6,13,14,2,3,8,7,24,22,0,12],"ROBINSONS TMP VISTA ANTIPOLO"],["ROBINSONS TMP EVIA",[16,4,15,20,11,21,6,13,2,3,24,22,14,8,7],"ROBINSONS TMP EVIA"],["WALTERMART MAKATI",[16,15,1,19,20,11,21,9,10,17,6,2,3,24,22,12,8,7,4],"WALTERMART MAKATI"],["WALTERMART SILANG",[16,15,20,11,9,6,2,3,24,22,17,8,7],"WALTERMART SILANG"],["QUINCY SUPERMARKET",[0,15,1,11,12,26,17,8,7],"QUINCY SUPERMARKET"],["SOUTH SMKT MALOLOS",[15,1,11,12,21,27,18,9,10,26,13,14,2,3,24,22,17,8,7],"SOUTH SMKT MALOLOS ( Tuesday & Friday)"],["SOUTH SMKT PASIG",[16,4,0,15,1,20,11,12,21,27,18,9,10,26,17,6,13,14,2,3,8,7],"SOUTH SMKT PASIG (Tues.& Saturday ) / SOUTH SMKT PASIG- (Tues.& Sat..)"],["SOUTH SMKT PAMPANGA",[15,20,11,12,21,18,9,10,26,17,13,14,2,3,24,22,8,7],"SOUTH SMKT PAMPANGA- (Tues.& Fri.) / SOUTH SMKT PAMPANGA- (Tues.& Fri..)"],["SM CITY CALOOCAN",[4,19,11,12,21,9,10,26,13,24,22,14,8,7,16,15,20],"SM CITY CALOOCAN"],["SM BACOOR",[16,15,1,19,20,11,12,21,27,9,10,26,17,13,24,22,8,7],"SM BACOOR"],["SM FAIRVIEW",[16,0,15,1,19,20,11,21,27,9,26,13,24,22,8,7],"SM FAIRVIEW"],["SM MAKATI",[16,0,15,1,19,20,11,12,27,9,10,26,17,13,14,2,3,24,22,8,7],"SM MAKATI"],["SM MANILA",[0,1,19,20,11,12,21,9,10,26,13,14,24,15,18,8],"SM MANILA"],["SM MEGAMALL A",[16,0,15,1,19,20,11,12,21,18,9,10,26,17,13,14,2,3,24,22,8,7],"SM MEGAMALL A"],["SM MEGAMALL B",[16,4,25,0,15,1,19,20,11,12,21,27,18,9,10,26,17,6,13,14,2,3,24,22,8,7],"SM MEGAMALL B"],["SM SAN LAZARO",[16,25,0,15,1,19,20,11,12,21,18,9,10,26,13,14,24,22,8,7,17],"SM SAN LAZARO"],["SM CHERRY SHAW",[16,15,1,19,20,11,21,27,18,9,10,26,6,13,14,24,22,17,8,7],"SM CHERRY SHAW"],["SM SOUTHMALL",[16,4,0,15,1,19,20,11,12,21,27,18,9,10,26,17,6,13,14,24,22,8,7],"SM SOUTHMALL"],["SM CENTER POINT",[15,1,19,11,18,9,10,26,17,6,13,14,24,22,8,7],"SM CENTER POINT"],["SM AURA",[16,0,15,1,19,20,11,12,21,27,18,9,10,26,17,6,13,14,2,3,24,22,8,7],"SM AURA"],["SM CITY MARIKINA",[16,15,1,19,20,11,12,21,18,9,10,26,13,14,24,8],"SM CITY MARIKINA"],["SM EAST ORTIGAS",[16,15,1,19,20,11,21,9,10,17,13,14,24,22,26,8,7,18],"SM EAST ORTIGAS"],["SM PAMPANGA",[16,4,19,20,11,12,21,9,10,26,13,24,22,15,14,8,7],"SM PAMPANGA"],["SM TELABASTAGAN",[16,4,15,19,20,11,21,9,10,26,13,14,24,22,12,8,7],"SM TELABASTAGAN"],["SM OLONGAPO CENTRAL",[16,15,19,20,11,12,21,9,10,26,13,24,22,4,14,8,7],"SM OLONGAPO CENTRAL"],["SM OLONGAPO DOWNTOWN",[16,4,19,20,11,21,9,26,24,22,15,12,10,13,14,8,7],"SM OLONGAPO DOWNTOWN"],["SM PODIUM",[],"SM PODIUM"],["SM SAVEMORE MARIKINA",[],"SM SAVEMORE MARIKINA"],["SM LIGHT",[4,20,11,9,24,26,8,7],"SM LIGHT"],["SM MEZZA",[15,11,21,9,13,24,10,8,7,26],"SM MEZZA"],["SM AVENUE MAKATI",[],"SM AVENUE MAKATI"],["SM ACACIA",[16,4,15,1,19,20,11,12,21,18,9,10,26,17,6,13,14,2,3,24,22,8,7,27],"SM ACACIA"],["SM VILLAGE SQUARE",[16,4,1,20,11,21,9,26,6,14,3,24,22,15,13,8,7,23,25,19,27,18,10],"SM VILLAGE SQUARE"],["SM FAIRVIEW ANNEX",[16,4,0,15,1,19,20,11,27,9,26,13,24,22,8,7],"SM FAIRVIEW ANNEX"],["SM IMUS",[1,11,9,24,22,8,7,16,15,12],"SM IMUS"],["SM JAZZ",[16,4,25,15,19,20,11,12,21,9,10,26,17,6,13,2,3,24,22,8,7,1,27,18],"SM JAZZ"],["SM CAINTA",[15,1,19,20,11,21,9,10,26,13,2,3,24,22,17,14,8,7,16,4],"SM CAINTA"],["SM MOLINO",[16,4,0,1,19,20,11,21,27,18,9,10,26,17,6,13,14,2,3,8,7,24,12],"SM MOLINO-Tues&Sats"],["SM NOVALICHES",[16,15,1,19,20,11,21,27,18,9,10,17,6,13,14,2,24,22,0,8,7,4,25,26,3],"SM NOVALICHES"],["SM TAYTAY",[16,25,15,1,19,20,11,12,21,18,9,10,26,6,13,14,2,3,24,22,17,8,7,4,0,27],"SM TAYTAY"],["SM SAN ISIDRO",[16,15,1,19,20,11,21,18,9,10,26,6,13,2,3,24,22,27,14,8,7,4,25,0,17],"SM SAN ISIDRO"],["SM HYPERMARKET CLARK",[16,4,0,15,1,19,20,11,12,21,27,18,9,10,26,17,6,13,14,2,3,24,22,25,8,7],"SM HYPERMARKET CLARK (Tues.& Fri.) / SM HYPERMARKET CLARK(Tues.&Fri.)"],["SM HYPERMARKET PAMPANGA",[19,20,11,21,27,9,6,2,3,24,22,16,4,25,1,18,26,17,13,14,8,7],"SM HYPERMARKET PAMPANGA(Tues.& Fri.) / SM HYPERMARKET PAMPANGA(Tues.&Fri.)"],["SM URBAN CENTRO EAST (CARSADANG BAGO)",[16,4,19,20,11,9,2,3,24,22,15,6,13,14,8,7,0],"SM URBAN CENTRO EAST (CARSADANG BAGO)"],["ROYAL DUTY FREE PALM ST. (STORE 1)",[4,25,20,11,9,26,2,3,7],"ROYAL DUTY FREE PALM ST. (STORE 1)"],["ROYAL DUTY FREE MANILA CANAL (STORE 2)",[4,25,20,11,9,26,2,3,7],"ROYAL DUTY FREE MANILA CANAL (STORE 2)"],["ROBINSONS NEPO MALL",[16,19,20,11,21,9,10,26,6,13,2,3,24,22,8,7],"ROBINSONS NEPO MALL"],["ROBINSONS STARMILLS",[16,20,11,21,9,10,2,24,22,26,8,7],"ROBINSONS STARMILLS"],["ONE WORLD DELI MAKATI",[4,20,11,9,26,13,8,7,25],"ONE WORLD DELI MAKATI"],["ONE WORLD DELI ALABANG",[4,25,19,20,11,18,9,26,6,13,24,22,14,8,7],"ONE WORLD DELI ALABANG"],["ONE WORLD DELI BGC",[4,25,19,20,11,18,9,26,6,13,24,22,14,8,7],"ONE WORLD DELI BGC"],["PRIME SUPERMARKET",[4,11,26,6,13,8,7,24,22,14],"PRIME SUPERMARKET / PRIME SUPERMARKET (Tues & Sat)"],["MITSUKOSHI B.G.C",[16,25,19,20,21,9,26,13,14,2,24,22,8,7,4],"MITSUKOSHI B.G.C"],["ROBINSONS CORINTHIAN HILLS",[16,15,11,21,9,10,26,17,6,13,14,2,3,24,22,8],"ROBINSONS CORINTHIAN HILLS"],["ROBINSONS KATIPUNAN",[16,4,0,15,1,11,12,21,27,9,10,26,17,6,13,14,2,3,24,22,8,7],"ROBINSONS KATIPUNAN"],["ROBINSONS TOMAS MORATO",[16,4,0,15,1,19,11,12,21,27,9,10,26,6,13,14,2,3,24,8,7,17],"ROBINSONS TOMAS MORATO"],["RUSTANS AYALA ALABANG",[15,11,12,21,26,2,3,24,8,7,17,13,14],"ROBINSONS AYALA ALABANG / RUSTANS AYALA ALABANG"],["RUSTANS THE GROVE",[16,4,15,11,12,21,9,10,17,13,14,2,3,24,26,8,0,27],"ROBINSONS THE GROVE / RUSTANS THE GROVE"],["ROBINSONS EASTWOOD GRAND PALAZZO",[16,11,12,27,17,13,14,2,3,24,22,15,8,7],"ROBINSONS EASTWOOD GRAND PALAZZO"],["ROBINSONS PARQAL TMP",[16,4,0,1,11,12,21,9,10,13,14,2,3,24,22,15,26,8,7,27,17,6],"ROBINSONS PARQAL TMP"],["ROBINSONS OPUS BRIDGETOWNE (TMP)",[16,0,15,19,20,11,12,21,18,9,10,26,17,6,13,2,3,24,22,8,7,14],"ROBINSONS OPUS BRIDGETOWNE (TMP)"],["ROBINSONS GATEWAY MALL 2-SHOPWISE",[16,0,15,1,11,12,21,27,9,10,26,17,6,13,3,24,22,8,7,4,14,2],"ROBINSONS GATEWAY MALL 2-SHOPWISE"],["ROBINSONS MAKATI - SHOPWISE",[16,0,15,1,11,12,21,27,9,10,26,17,13,14,2,3,24,22,8,7],"ROBINSONS MAKATI - SW / ROBINSONS MAKATI - ShopWise / SHOPWISE MAKATI"],["ROBINSONS SAN PEDRO",[16,1,11,12,21,9,17,13,14,2,3,24,22,8,7],"ROBINSONS SAN PEDRO / SHOPWISE SAN PEDRO"],["ROBINSONS SUCAT",[4,0,15,1,19,20,11,12,21,9,10,17,6,13,24,22,16,25,27,26,14,2,3,8,7],"ROBINSON SUCAT / ROBINSONS SUCAT"],["ROBINSONS STA.ROSA",[11,12,9,10,13,2,3,24,22,8,7],"ROBINSONS STA.ROSA / SHOPWISE STA.ROSA"],["CITY SUPER INC",[16,4,25,0,1,19,20,11,12,21,27,18,9,10,26,17,6,13,14,2,3,24,22,8,7],"CITY SUPER INC."],["CITY SUPER ALABANG INC",[16,4,0,1,19,20,11,12,21,27,18,9,10,26,17,6,13,14,2,3,24,22,8,7,25],"CITY SUPER ALABANG INC."],["THE LANDMARK CORPORATION-MANILA BAY",[16,4,19,20,11,12,10,13,14,24,22,8,7],"THE LANDMARK CORPORATION-MANILA BAY"],["CITY SUPER NUVALI",[20,11,12,21,14,2,24,22,8,7],"CITY SUPER NUVALI"],["HI-TOP AURORA",[25,1,9,10,26,17,6,24,22,8,7],"HI-TOP AURORA"],["HI-TOP SUPERMARKET QC",[16,4,0,15,1,19,20,11,12,21,18,9,10,26,6,24,22,27,17,8,7],"HI-TOP SUPERMARKET QC"],["SOUTH SMKT ALABANG",[16,4,25,0,15,1,19,20,11,12,21,27,18,9,10,26,17,6,13,14,2,3,24,22,8,7],"SOUTH SMKT ALABANG"],["SOUTH SMKT STA. ROSA",[25,15,1,19,11,21,26,17,13,14,2,3,24,22,8,7],"SOUTH SMKT STA. ROSA"],["SOUTH SMKT BF PARAÑAQUE",[16,15,20,11,9,17,6,13,2,3,8,7,24,22,14],"SOUTH SMKT BF PARAÑAQUE (Wed.&Sun.)"],["SOUTH SMKT BRENT",[16,15,20,11,9,26,17,13,14,2,3,8,7,24,22],"SOUTH SMKT BRENT"],["SOUTH SMKT CALAMBA",[16,15,20,11,12,21,9,26,13,14,2,8,7,24,19],"SOUTH SMKT CALAMBA"],["WALTERMART NORTH",[16,0,15,1,19,20,11,12,21,9,10,17,6,2,3,24,22,8,7,4,26],"WALTERMART NORTH"],["WALTERMART W MALL",[16,0,15,1,19,20,11,12,21,9,17,6,2,24,22,8,7,4,10,26,3],"WALTERMART W MALL"],["WALTERMART E. RODRIGUEZ",[16,4,15,1,19,20,11,12,21,9,10,17,6,2,3,24,22,8,7,0,26],"WALTERMART E ROD. / WALTERMART E. ROD / WALTERMART E. RODRIGUEZ"],["ROBINSONS SW OLIVAREZ CALAMBA",[16,4,15,11,12,21,26,17,6,13,14,2,3,7,24],"ROBINSONS SW OLIVAREZ CALAMBA / ROBINSONS SW OLIVAREZ CALAMBA (Wed. & Sun.)"],["ROBINSONS BF RUINS",[16,4,25,0,15,1,19,20,11,12,21,27,18,9,10,26,17,6,13,14,2,3,24,22,8,7],"ROBINSONS BF RUINS"],["ROBINSONS NUVALI",[16,4,0,15,1,19,20,11,12,21,27,18,9,10,17,13,14,2,3,24,22,26,8,7],"ROBINSONS-NUVALI"],["ROBINSONS TIMOG",[15,1,19,11,9,10,14,24,22,26,13,2,3,8,7],"ROBINSONS TIMOG"],["ROBINSONS EASTWOOD",[25,0,15,1,20,11,12,21,27,10,26,17,6,13,14,2,3,24,22,9,8,7,16],"ROBINSONS EASTWOOD"],["ROBINSONS SOUTHWOODS",[16,15,1,19,20,11,12,21,27,18,9,10,26,17,6,13,14,2,3,24,22,8,7,4,25],"ROBINSONS SOUTHWOODS"],["ROBINSONS LAS PINAS",[16,0,15,1,19,20,11,12,18,9,10,26,17,13,14,2,24,4,8,7,3],"ROBINSONS LAS PINAS"],["ROBINSONS GALLERIA SOUTH",[4,1,19,20,11,12,21,9,10,26,17,13,14,2,24,22,16,25,15,27,18,6,8,7],"ROBINSONS GALLERIA SOUTH"],["ROBINSONS CAPITOL HILLS",[16,15,19,20,11,12,21,10,26,6,13,14,2,3,24,22,4,25,0,9,8,7],"ROBINSONS CAPITOL HILLS"],["ROBINSONS GATEWAY",[16,11,21,9,13,14,24,22,6,8,7,15,2,3],"ROBINSONS GATEWAY"],["ROBINSONS TMP MOLITO",[16,4,25,0,15,1,19,20,11,12,21,27,18,9,10,26,17,6,13,14,2,3,24,22,8,7],"ROBINSONS TMP MOLITO"],["ROBINSONS PACITA",[15,1,11,21,9,10,26,13,14,2,24,22,4,12,17,8,7],"ROBINSONS PACITA-Weds & Fri only"],["PUREGOLD WEST TRIANGLE",[16,11,21,24,22,8,7],"PUREGOLD WEST TRIANGLE.- Wed & Fri only"],["PPCI - SOUTHPARK BF HOMES PQUE",[16,11,21,24,22,8,7],"PPCI- SOUTHPARK BF HOMES PQUE / PPCI- SOUTHPARK BF HOMES PQUE-Wed & Fri"],["SM STO.TOMAS BATANGAS",[25,0,15,19,20,11,12,27,9,10,26,13,14,2,3,8,7,24,22,16,4],"SM STO.TOMAS BATANGAS / SM STO.TOMAS BATANGAS (Wed & Sun.)"],["SM CUBAO",[16,0,15,1,19,20,11,12,21,27,9,10,17,6,13,14,24,22,4,25,18,26,8,7],"SM CUBAO"],["SM STA. ROSA",[15,1,19,11,12,9,10,26,17,13,14,24,22,16,8,7],"SM STA. ROSA"],["SM NORTH EDSA",[16,15,1,19,20,11,12,21,9,26,13,24,22,0,27,10,17,6,14,8,7],"SM NORTH EDSA"],["SM BF PARAÑAQUE",[16,15,1,19,20,11,12,21,18,9,10,26,13,14,24,22,4,0,8,7],"SM BF PARAÑAQUE"],["SM CENTER LAS PINAS",[16,4,25,15,1,19,11,21,18,9,10,26,17,6,13,14,2,3,24,22,27,8,7],"SM CENTER LAS PINAS"],["SM CENTER SAN PEDRO",[4,19,11,21,9,13,14,2,8,7,24,22,16,15,20,10,26],"SM CENTER SAN PEDRO / SM CENTER SAN PEDRO (Wed. & Sun.)"],["SM HYPERMART CUBAO",[0,20,11,12,21,10,26,2,24,22,4,1,27,13,14,3,8,7],"SM HYPERMART CUBAO"],["SM MALL OF ASIA",[16,4,25,0,15,1,19,20,11,12,21,27,18,9,10,26,17,6,13,14,2,3,24,22,8,7],"SM MALL OF ASIA"],["SM MAKATI HYPERMART",[15,11,21,9,10,13,2,24,22,16,12,26,14,3,8,7],"SM MAKATI HYPERMART"],["SM PASIG",[16,25,0,15,1,19,20,11,12,21,18,9,10,26,17,6,13,14,2,3,24,22,4,27,8,7],"SM PASIG"],["SM SUCAT",[16,4,25,15,1,19,20,11,12,21,27,18,9,10,26,17,6,13,14,2,3,24,22,8,7],"SM SUCAT"],["SM SUCAT LOPEZ",[19,11,12,13,14,2,24,22,16,3,8,7,15],"SM SUCAT LOPEZ"],["SM SUPER SM NORTH",[16,25,0,15,1,20,11,9,10,17,13,14,2,3,24,22,4,27,26,8,7],"SM SUPER SM NORTH"],["SM CONGRESSIONAL",[16,0,15,1,19,20,11,12,21,18,9,10,26,6,13,2,3,24,22,27,17,14,8,7],"SM CONGRESSIONAL"],["SM BICUTAN",[16,4,0,1,19,20,11,12,21,27,18,9,10,26,17,6,13,14,2,3,8,7,24,22,25],"SM BICUTAN-Wed&Sun"],["SM MARILAO",[16,25,15,1,11,12,9,10,17,6,13,3,8,7,24,22,27,26,14,2],"SM MARILAO- Wed & Sun only"],["SM VALENZUELA",[16,25,0,15,1,19,20,11,12,21,18,9,10,13,2,3,8,7,24,22,4,27,17,6,14],"SM VALENZUELA- Wed & Sun only"],["SM URBAN DECA HOMES",[25,0,1,19,20,11,12,27,10,17,6,13,8,7,24,22,16,4,15,9,14,2,3],"SM URBAN DECA HOMES-Wed & Sun only"],["MERRY MART KATIPUNAN",[16,1,19,20,11,21,9,10,6,24,22,12,26,8,7,15,27],"MERRY MART KATIPUNAN"],["MERRY MART NUVALI",[16,15,1,19,20,11,21,24,22,8,7],"MERRY MART NUVALI"],["FISHERMALL QC",[16,25,15,19,11,12,21,9,10,6,24,22,1,26,8,7],"FISHERMALL QC"],["ONE WORLD DELI TIMOG",[25,19,20,11,18,9,26,6,13,14,24,22,8,7,4],"ONE WORLD DELI TIMOG"],["SOUTH SMKT MARIKINA",[16,0,15,1,11,12,17,6,13,14,2,3,8,7,24,22],"SOUTH SMKT MARIKINA Thursday only"],["PUREGOLD TAGUIG",[17,8,7,24,22],"PUREGOLD TAGUIG-THURSDAY ONLY"],["SOUTH SMKT LIPA",[16,4,25,15,1,11,21,27,18,9,10,26,17,6,13,14,2,3,8,7,24,22],"SOUTH SMKT LIPA-Fri only"],["SOUTH SMKT LOS BAÑOS",[],"SOUTH SMKT LOS BAñOS-Fri only"],["SOUTH SMKT STO.TOMAS",[25,15,1,11,21,26,17,13,14,2,3,8,7,24,22],"SOUTH SMKT STO.TOMAS-Fri only"],["ROBINSONS LOS BAÑOS",[4,25,0,15,1,11,12,21,9,10,26,17,13,14,2,3,8,7,24,22],"ROBINSONS LOS BAÑOS - Fri only"],["ROBINSONS STA. CRUZ",[4,25,0,15,1,11,12,21,9,10,26,17,6,13,14,2,3,8,7,24,22],"ROBINSONS STA. CRUZ - Fri only"],["ROBINSONS GREENBELT",[],"ROBINSONS GREENBELT"],["ROBINSONS SAN ANTONIO",[],"ROBINDONS SAN ANTONIO"],["ROBINSONS KAI",[],"ROBINSONS KAI"],["WALTERMART SHERIDAN",[],"WALTERMART SHERIDAN"],["WALTERMART NOVALICHES",[],"WALTERMART NOVALICHES"],["WALTERMART MADISON",[],"WALTERMART MADISON"],["AYAGOLD AVIDA",[],"AYAGOLD AVIDA"],["ROBINSONS PIONEER",[],"ROBINSONS PIONEER"]];
+
+// Products created in Product Master by Apply (if not there yet): [name, category]
+const FG_SM_IMPORT_NEW_PRODUCTS = [
+  ['WHOLE WHEAT TORTILLA 12”', 'TORTILLA'],
+  ['CINNAMON SUGAR BREAD FRIES', 'BREAD']
+];
+
+function smTokens_(s){
+  let u = s_(s).toUpperCase().replace(/[“”″]/g,'"').replace(/&/g,' AND ')
+    .replace(/(\d)\s*("|INCHES\b|INCH\b|IN\b)/g,'$1IN').replace(/W\//g,'WITH ')
+    .replace(/(?<!\d)\.|\.(?!\d)/g,' ').replace(/[(),\-\/]+/g,' ')
+    .replace(/\bMULTI\s+GRAIN\b/g,'MULTIGRAIN').replace(/\bHOT\s*DOG\b/g,'HOTDOG').replace(/\bBREAD\s+STICKS?\b/g,'BREADSTICK');
+  const SYN = {WW:['WHOLE','WHEAT'], PDSL:['PANDESAL'], BAG:['BAGUETTE'], BAT:['BATARD'], BRD:['BREAD'], STK:['STICK'], LOAVES:['LOAF']};
+  const out = [];
+  u.split(/\s+/).filter(Boolean).forEach(t=>{
+    (SYN[t] || [t]).forEach(w=>{
+      if(w.length>3 && /S$/.test(w) && !/SS$/.test(w) && !/\d/.test(w)) w = w.slice(0,-1);
+      if(out.indexOf(w)<0) out.push(w);
+    });
+  });
+  return out;
+}
+
+/** Exact-name key: same text ignoring case, extra spaces and straight vs curly quotes. */
+function smExactKey_(s){ return s_(s).toUpperCase().replace(/[“”″]/g,'"').replace(/\s+/g,' ').trim(); }
+
+function smMatchBread_(forecast, key, pmNames){
+  const tk = smTokens_(key), tf = smTokens_(forecast);
+  const same = (a,b)=> a.length===b.length && a.every(x=>b.indexOf(x)>=0);
+  let exact = pmNames.filter(p=>{ const tp=smTokens_(p); return same(tp,tk) || same(tp,tf); });
+  if(exact.length===1) return {pm:exact[0], status:'MATCHED', candidates:[]};
+  const pick = (keyTokens, note)=>{
+    const cands = pmNames.map(p=>({p:p, t:smTokens_(p)})).filter(x=>keyTokens.every(k=>x.t.indexOf(k)>=0));
+    if(!cands.length) return null;
+    if(cands.length===1) return {pm:cands[0].p, status:'MATCHED'+note, candidates:[]};
+    const extra = x=> x.t.length - keyTokens.length;
+    const min = Math.min.apply(null, cands.map(extra));
+    const best = cands.filter(x=>extra(x)===min);
+    if(best.length===1) return {pm:best[0].p, status:'MATCHED'+note, candidates:cands.map(x=>x.p)};
+    return {pm:'', status:'AMBIGUOUS', candidates:cands.map(x=>x.p)};
+  };
+  let r = pick(tk,'') || pick(tf,'');
+  if(r) return r;
+  const noSize = tk.filter(t=>!/^\d+(\.\d+)?IN$/.test(t));
+  if(noSize.length < tk.length){
+    // Only accept Product Master names that have NO size at all (never swap 12" for 10").
+    const sizeless = pmNames.filter(p=>!smTokens_(p).some(t=>/^\d+(\.\d+)?IN$/.test(t)));
+    const saved = pmNames; pmNames = sizeless;
+    r = pick(noSize,' (size not in name)');
+    pmNames = saved;
+    if(r) return r;
+  }
+  return {pm:'', status:'NOT FOUND', candidates:[]};
+}
+
+function smImportPlan_(){
+  const pm = productMasterSheet_();
+  const pmRows = pm.getLastRow()<2 ? [] : pm.getRange(2,1,pm.getLastRow()-1,8).getValues();
+  const pmNames = pmRows.filter(r=>s_(r[1]) && s_(r[7]).toUpperCase()!=='NO').map(r=>s_(r[1]));
+  const allPmKeys = {}; pmRows.forEach(r=>{ if(s_(r[1])) allPmKeys[smExactKey_(r[1])]=1; });
+  const productsToCreate = FG_SM_IMPORT_NEW_PRODUCTS.filter(p=>!allPmKeys[smExactKey_(p[0])]);
+  productsToCreate.forEach(p=>pmNames.push(p[0]));   // so their pairs are planned too
+  const pmByUpper = {}; pmNames.forEach(n=>pmByUpper[n.toUpperCase()]=n);
+  const pmExact = {}; pmNames.forEach(n=>{ const k=smExactKey_(n); if(!pmExact[k]) pmExact[k]=n; });
+
+  // keep overrides typed in the preview sheet (column F)
+  const overrides = {};
+  const ps = ss_().getSheetByName('Supermarket Import');
+  if(ps && ps.getLastRow()>=4){
+    ps.getRange(4,1,ps.getLastRow()-3,6).getValues().forEach(r=>{ if(s_(r[0]) && s_(r[5])) overrides[s_(r[0])] = s_(r[5]); });
+  }
+  const counts = FG_SM_IMPORT_BREADS.map(()=>0);
+  FG_SM_IMPORT_STORES.forEach(s=>s[1].forEach(i=>counts[i]++));
+  const breads = FG_SM_IMPORT_BREADS.map((b,i)=>{
+    const ov = overrides[b[0]];
+    let m;
+    if(ov){
+      m = pmByUpper[ov.toUpperCase()] ? {pm:pmByUpper[ov.toUpperCase()], status:'MATCHED (override)', candidates:[]}
+                                     : {pm:'', status:'OVERRIDE NOT IN PRODUCT MASTER', candidates:[]};
+    }else if(pmExact[smExactKey_(b[1])]){
+      const isNew = productsToCreate.some(p=>smExactKey_(p[0])===smExactKey_(b[1]));
+      m = {pm:pmExact[smExactKey_(b[1])], status: isNew ? 'MATCHED (new product - created on Apply)' : 'MATCHED', candidates:[]};
+    }else m = smMatchBread_(b[0], b[1], pmNames);
+    return {forecast:b[0], pm:m.pm, status:m.status, candidates:m.candidates, count:counts[i], override:ov||''};
+  });
+
+  const cm = ensureCustomerMaster_();
+  const cmRows = customerMasterRows_();
+  const cmByUpper = {}; cmRows.forEach(x=>cmByUpper[x.customer.toUpperCase()]=x);
+  const sm = supermarketSheet_();
+  const smRows = sm.getLastRow()<2 ? [] : sm.getRange(2,1,sm.getLastRow()-1,3).getValues();
+  const smIndex = {}; smRows.forEach((r,i)=>{ smIndex[s_(r[0]).toUpperCase()+'||'+s_(r[1]).toUpperCase()] = {row:i+2, status:s_(r[2]).toUpperCase()}; });
+
+  const newStores=[], existingStores=[], pairsAdd=[], pairsReactivate=[]; let pairsExisting=0, pairsSkipped=0;
+  FG_SM_IMPORT_STORES.forEach(s=>{
+    const name = s[0];
+    if(cmByUpper[name.toUpperCase()]) existingStores.push(name); else newStores.push(name);
+    s[1].forEach(i=>{
+      const pmName = breads[i].pm;
+      if(!pmName){ pairsSkipped++; return; }
+      const hit = smIndex[name.toUpperCase()+'||'+pmName.toUpperCase()];
+      if(!hit) pairsAdd.push([name, pmName, 'ACTIVE']);
+      else if(hit.status && hit.status!=='ACTIVE' && hit.status!=='YES') pairsReactivate.push(hit.row);
+      else pairsExisting++;
+    });
+  });
+  // de-duplicate pairs (two forecast breads can map to the same Product Master name)
+  const seen = {}; const addUnique = pairsAdd.filter(p=>{ const k=p[0].toUpperCase()+'||'+p[1].toUpperCase(); if(seen[k]) return false; seen[k]=1; return true; });
+  return {productsToCreate:productsToCreate, pm:pm, breads:breads, newStores:newStores, existingStores:existingStores, pairsAdd:addUnique,
+          pairsReactivate:[...new Set(pairsReactivate)], pairsExisting:pairsExisting, pairsSkipped:pairsSkipped, cm:cm, sm:sm};
+}
+
+function previewSupermarketImport_(){
+  const p = smImportPlan_();
+  let sh = ss_().getSheetByName('Supermarket Import');
+  if(!sh) sh = ss_().insertSheet('Supermarket Import');
+  sh.clearContents();
+  sh.getRange(1,1).setValue('SUPERMARKET IMPORT PREVIEW - from OCTOBER 05-11 2026 FORECAST - ' + Utilities.formatDate(new Date(), FG_CFG.TZ, 'yyyy-MM-dd HH:mm'));
+  sh.getRange(2,1).setValue('To fix an AMBIGUOUS / NOT FOUND bread: type the exact Product Master name in column F, then click Preview again. Leave F blank to skip that bread.');
+  sh.getRange(3,1,1,6).setValues([['Forecast Bread','Product Master Name (used)','Status','Possible matches','# Supermarkets','Use this Product Master name (optional)']]);
+  sh.getRange(4,1,p.breads.length,6).setValues(p.breads.map(b=>[b.forecast,b.pm,b.status,b.candidates.join(' | '),b.count,b.override]));
+  sh.getRange(3,8,1,3).setValues([['Supermarket','Status','Names in forecast']]);
+  const st = FG_SM_IMPORT_STORES.map(s=>[s[0], p.newStores.indexOf(s[0])>=0 ? (s[1].length?'NEW':'NEW (no orders in forecast)') : 'ALREADY IN CUSTOMER MASTER', s[2]]);
+  sh.getRange(4,8,st.length,3).setValues(st);
+  sh.setFrozenRows(3);
+  return smSummary_(p);
+}
+
+function smSummary_(p){
+  return {
+    ok:true,
+    breads:p.breads.map(b=>({forecast:b.forecast, pm:b.pm, status:b.status, candidates:b.candidates, count:b.count})),
+    productsToCreate:(p.productsToCreate||[]).map(x=>x[0]),
+    storesTotal:FG_SM_IMPORT_STORES.length, storesNew:p.newStores.length, storesExisting:p.existingStores.length,
+    pairsAdd:p.pairsAdd.length, pairsReactivate:p.pairsReactivate.length, pairsExisting:p.pairsExisting, pairsSkipped:p.pairsSkipped
+  };
+}
+
+function applySupermarketImport_(){
+  const p = smImportPlan_();
+  const now = new Date();
+  if(p.productsToCreate.length){
+    const ids = p.pm.getLastRow()<2 ? [] : p.pm.getRange(2,1,p.pm.getLastRow()-1,1).getDisplayValues().map(r=>s_(r[0]));
+    let max = 0; ids.forEach(id=>{ const mm=id.match(/^SM-(\d+)$/i); if(mm) max=Math.max(max,Number(mm[1])); });
+    const rows = p.productsToCreate.map((x,i)=>['SM-'+String(max+1+i).padStart(3,'0'), x[0], 'SUPERMARKET', x[1], 'PACK', '', '', 'YES']);
+    p.pm.getRange(p.pm.getLastRow()+1,1,rows.length,8).setValues(rows);
+  }
+  if(p.newStores.length)
+    p.cm.getRange(p.cm.getLastRow()+1,1,p.newStores.length,4).setValues(p.newStores.map(n=>[n,'SUPERMARKET','ACTIVE',now]));
+  if(p.pairsAdd.length)
+    p.sm.getRange(p.sm.getLastRow()+1,1,p.pairsAdd.length,3).setValues(p.pairsAdd);
+  p.pairsReactivate.forEach(r=>p.sm.getRange(r,3).setValue('ACTIVE'));
+  const sum = smSummary_(p);
+  logTxn_({type:'SUPERMARKET IMPORT', ref:'FORECAST OCT 05-11 2026', marketType:'SUPERMARKET', customer:'', item:'', internalCode:'',
+    qtyIn:0, qtyOut:0, user:FG_SESSION_?FG_SESSION_.username:'',
+    remarks:'Products created '+sum.productsToCreate.length+' | Stores added '+sum.storesNew+' | Pairs added '+sum.pairsAdd+' | Reactivated '+sum.pairsReactivate+' | Skipped (bread not matched) '+sum.pairsSkipped});
+  sum.applied = true;
+  return sum;
+}
+
+
+/* ==================== V140 FG RECEIVING RETURNS -> PRODUCTION ====================
+   Flow (same TR number from start to finish):
+     1. FG Receiving receives LESS than transferred -> the difference is RETURNED to
+        Production (sheet "FG Returns", status FOR PRODUCTION ACTION). FG must give a reason.
+     2. Production chooses what was done:
+          RE-SEAL / REPACKING / RE-TAGGING / RE-SORTING
+              -> a new line is added to the SAME TR number (status PENDING) and goes
+                 back to FG Receiving, then Metal Detection - the normal process.
+          REJECT
+              -> status REJECTED - FOR PDR; the PDR form opens pre-filled.
+     3. A re-transmitted line can be rejected again; it simply loops.
+=================================================================================== */
+const FG_RETURN_SHEET = 'FG Returns';
+const FG_RETURN_ACTIONS = ['RE-SEAL','REPACKING','RE-TAGGING','RE-SORTING','REJECT'];
+const FG_RETURN_HEAD = ['Return No.','Date Returned','Transfer No.','Transmittal Row','Product','Internal Code',
+  'Market Type','Customer','Unit','Qty Returned','FG Reject Reason','Returned By (FG)','Status',
+  'Production Action','Action By','Action Date','Action Remarks','Re-transmit Row / PDR No.',
+  'Qty Re-transmitted','Qty Rejected'];
+
+function fgReturnSheet_(){
+  let sh = ss_().getSheetByName(FG_RETURN_SHEET);
+  if(!sh){
+    sh = ss_().insertSheet(FG_RETURN_SHEET);
+    sh.getRange(1,1,1,FG_RETURN_HEAD.length).setValues([FG_RETURN_HEAD]);
+    sh.setFrozenRows(1);
+  }else if(s_(sh.getRange(1,19).getValue())!=='Qty Re-transmitted'){
+    ensureColumns_(sh,FG_RETURN_HEAD.length);
+    sh.getRange(1,19,1,2).setValues([['Qty Re-transmitted','Qty Rejected']]);
+  }
+  return sh;
+}
+
+function nextFgReturnNo_(sh){
+  const y = Utilities.formatDate(new Date(), FG_CFG.TZ, 'yyyy');
+  let max = 0;
+  if(sh.getLastRow()>=2) sh.getRange(2,1,sh.getLastRow()-1,1).getDisplayValues().forEach(r=>{
+    const m = s_(r[0]).match(/^RT-(\d{4})-(\d+)$/i); if(m && m[1]===y) max = Math.max(max, Number(m[2]));
+  });
+  return 'RT-'+y+'-'+String(max+1).padStart(4,'0');
+}
+
+function createFgReturn_(trNo, trRow, tr, qty, reason, by, stamp){
+  const sh = fgReturnSheet_();
+  const no = nextFgReturnNo_(sh);
+  sh.getRange(sh.getLastRow()+1,1,1,FG_RETURN_HEAD.length).setValues([[
+    no, stamp, trNo, trRow, s_(tr[3]), s_(tr[4]), s_(tr[12]), s_(tr[13]), s_(tr[6])||'PACK', qty,
+    reason, by, 'FOR PRODUCTION ACTION', '', '', '', '', '', '', ''
+  ]]);
+  logTxn_({type:'FG RETURN TO PRODUCTION', ref:trNo, marketType:s_(tr[12]), customer:s_(tr[13]), item:s_(tr[3]),
+    internalCode:s_(tr[4]), qtyIn:0, qtyOut:0, user:by, remarks:no+' | '+qty+' '+(s_(tr[6])||'PACK')+' returned | Reason: '+reason});
+  return {returnNo:no, product:s_(tr[3]), qty:qty};
+}
+
+function fgReturnRows_(){
+  const sh = ss_().getSheetByName(FG_RETURN_SHEET);
+  if(!sh || sh.getLastRow()<2) return [];
+  return sh.getRange(2,1,sh.getLastRow()-1,FG_RETURN_HEAD.length).getValues().map((r,i)=>({
+    sheetRow:i+2, returnNo:s_(r[0]), dateTime:dateTimeText_(r[1]), transmittalNo:s_(r[2]), transmittalRow:n_(r[3]),
+    product:s_(r[4]), internalCode:s_(r[5]), marketType:s_(r[6]), customer:s_(r[7]), unit:s_(r[8]),
+    qty:n_(r[9]), fgReason:s_(r[10]), returnedBy:s_(r[11]), status:s_(r[12]), action:s_(r[13]),
+    actionBy:s_(r[14]), actionDate:dateTimeText_(r[15]), actionRemarks:s_(r[16]), link:s_(r[17]),
+    qtyRetransmitted:r[18]===''?'':n_(r[18]), qtyRejected:r[19]===''?'':n_(r[19])
+  })).filter(x=>x.returnNo);
+}
+
+/** Pending returns (for Production) + the 30 most recent processed ones. */
+function listFgReturns_(){
+  const all = fgReturnRows_();
+  const pending = all.filter(x=>x.status==='FOR PRODUCTION ACTION');
+  const done = all.filter(x=>x.status!=='FOR PRODUCTION ACTION').slice(-30).reverse();
+  return {pending:pending, recent:done, actions:FG_RETURN_ACTIONS};
+}
+
+function processFgReturn_(p){
+  p = p || {};
+  const no = s_(p.returnNo), remarks = s_(p.remarks);
+  let action = s_(p.action).toUpperCase(); if(action==='REJECT - PDR') action='REJECT';
+  if(!no) throw new Error('Select a returned item.');
+  if(FG_RETURN_ACTIONS.indexOf(action)<0) throw new Error('Select the Production action / reason.');
+  const by = FG_SESSION_ ? FG_SESSION_.username : s_(p.by);
+  const sh = fgReturnSheet_();
+  const x = fgReturnRows_().find(r=>r.returnNo===no);
+  if(!x) throw new Error('Return '+no+' was not found. Please refresh.');
+  if(x.status!=='FOR PRODUCTION ACTION') throw new Error(no+' was already processed ('+x.status+').');
+  const now = new Date();
+
+  if(action==='REJECT'){
+    sh.getRange(x.sheetRow,13,1,5).setValues([['REJECTED - FOR PDR', action, by, now, remarks]]);
+    sh.getRange(x.sheetRow,19,1,2).setValues([[0, x.qty]]);
+    logTxn_({type:'FG RETURN - REJECT TO PDR', ref:x.transmittalNo, marketType:x.marketType, customer:x.customer,
+      item:x.product, internalCode:x.internalCode, qtyIn:0, qtyOut:0, user:by, remarks:no+' | '+x.qty+' '+x.unit+(remarks?' | '+remarks:'')});
+    return {ok:true, mode:'PDR', ret:x, fgReturns:listFgReturns_(),
+      pdr:{referenceNo:no+' / '+x.transmittalNo, product:x.product, internalCode:x.internalCode, qty:x.qty,
+           concern:'Rejected at FG Receiving: '+x.fgReason, area:'FG RECEIVING', remarks:remarks}};
+  }
+
+  // Rework -> the typed quantity goes back to FG Receiving (same TR); the rest is rejected -> PDR
+  const qtyBack = n_(p.qty);
+  if(!(qtyBack>0)) throw new Error('Enter the quantity to re-transmit for '+no+'. If nothing can be recovered, choose 5. Reject.');
+  if(qtyBack > x.qty) throw new Error('Quantity to re-transmit ('+qtyBack+') cannot be more than the returned quantity ('+x.qty+').');
+  const qtyRej = x.qty - qtyBack;
+  if(qtyRej>0 && !remarks) throw new Error(qtyRej+' '+x.unit+' will be rejected. Enter the reason in Remarks (e.g. contaminated).');
+  const trSh = sheet_(FG_CFG.SHEETS.TRANSMITTAL);
+  ensureColumns_(trSh,15);
+  const orig = trSh.getRange(x.transmittalRow,1,1,15).getValues()[0];
+  if(s_(orig[1])!==x.transmittalNo) throw new Error('Original transmittal line for '+no+' could not be found.');
+  const newRow = trSh.getLastRow()+1;
+  trSh.getRange(newRow,1,1,15).setValues([[
+    now, x.transmittalNo, s_(orig[2])||'PRODUCTION', x.product, x.internalCode, qtyBack, x.unit||s_(orig[6])||'PACK',
+    orig[7], by, '', 'PENDING',
+    'RE-TRANSMIT ('+action+') - '+no+(remarks?' | '+remarks:''), s_(orig[12]), s_(orig[13]), no
+  ]]);
+  sh.getRange(x.sheetRow,13,1,8).setValues([[qtyRej>0?'RE-TRANSMITTED (PARTIAL)':'RE-TRANSMITTED', action, by, now, remarks,
+    'Transmittal row '+newRow, qtyBack, qtyRej]]);
+  logTxn_({type:'FG RETURN - RE-TRANSMIT', ref:x.transmittalNo, marketType:x.marketType, customer:x.customer,
+    item:x.product, internalCode:x.internalCode, qtyIn:0, qtyOut:0, user:by,
+    remarks:no+' | '+action+' | '+qtyBack+' '+x.unit+' sent back to FG Receiving'+(qtyRej>0?' | '+qtyRej+' rejected':'')+(remarks?' | '+remarks:'')});
+
+  let pdr = null;
+  if(qtyRej>0){
+    // the rejected part gets its own return record so it shows under Pending PDR until a PDR is saved
+    const rejNo = nextFgReturnNo_(sh);
+    sh.getRange(sh.getLastRow()+1,1,1,FG_RETURN_HEAD.length).setValues([[
+      rejNo, now, x.transmittalNo, x.transmittalRow, x.product, x.internalCode, x.marketType, x.customer, x.unit, qtyRej,
+      'Rejected during '+action+' of '+no+': '+remarks, by, 'REJECTED - FOR PDR', 'REJECT', by, now, remarks, '', 0, qtyRej
+    ]]);
+    logTxn_({type:'FG RETURN - REJECT TO PDR', ref:x.transmittalNo, marketType:x.marketType, customer:x.customer,
+      item:x.product, internalCode:x.internalCode, qtyIn:0, qtyOut:0, user:by, remarks:rejNo+' (from '+no+') | '+qtyRej+' '+x.unit+' | '+remarks});
+    pdr = {referenceNo:rejNo+' / '+x.transmittalNo, product:x.product, internalCode:x.internalCode, qty:qtyRej,
+           concern:'Rejected during '+action+' (FG return '+no+'): '+remarks, area:'PRODUCTION', remarks:remarks, returnNo:rejNo, tr:x.transmittalNo};
+  }
+  return {ok:true, mode:'RETRANSMIT', ret:x, qtyBack:qtyBack, qtyRejected:qtyRej, pdr:pdr, fgReturns:listFgReturns_(),
+    pendingTransfers:pendingTransfers_(), savedTransfers:savedTransfers_(), dashboard:dashboard_()};
+}
+
+/** When a PDR is saved with a Return No. (RT-yyyy-nnnn) in its reference, write the PDR No. back. */
+function linkFgReturnToPDR_(ref, pdrNo){
+  const m = s_(ref).match(/RT-\d{4}-\d+/i); if(!m) return;
+  const x = fgReturnRows_().find(r=>r.returnNo.toUpperCase()===m[0].toUpperCase());
+  if(x && x.status==='REJECTED - FOR PDR') fgReturnSheet_().getRange(x.sheetRow,18).setValue(pdrNo);
+}
+
+
+/* ==================== V145 MAINTENANCE MODE + APP VERSION ====================
+   Admin turns it ON before an update (Admin / Personnel page, or the orange bar).
+   While ON:
+     - The login page shows "SYSTEM UNDER MAINTENANCE" for everyone.
+     - Only ADMIN can log in and save. Every other call is refused on the SERVER.
+     - Tablets already logged in are locked (within 30s) but keep what was typed;
+       they unlock by themselves when it is turned OFF.
+   FG_APP_VERSION: change it on every update. Tablets running an older screen
+   see "New version available - tap to reload".
+============================================================================== */
+const FG_APP_VERSION = 'V145 MAINTENANCE MODE';
+const FG_MAINT_KEY = 'FG_MAINTENANCE';
+
+function maint_(){
+  const cache = CacheService.getScriptCache();
+  let raw = cache.get(FG_MAINT_KEY);
+  if(raw === null){
+    raw = PropertiesService.getScriptProperties().getProperty(FG_MAINT_KEY) || '{"on":false}';
+    cache.put(FG_MAINT_KEY, raw, 600);
+  }
+  try { const m = JSON.parse(raw); return {on:!!m.on, message:s_(m.message), by:s_(m.by), at:s_(m.at)}; }
+  catch(_) { return {on:false, message:'', by:'', at:''}; }
+}
+
+function maintenanceError_(){
+  const m = maint_();
+  throw new Error('MAINTENANCE: System under maintenance'+(m.message ? ' - '+m.message : '')+
+    '. Please wait; the system will be available again shortly.');
+}
+
+function systemStatus_(){
+  let url = '';
+  try { url = ScriptApp.getService().getUrl(); } catch(_) {}
+  return {maintenance: maint_(), appVersion: FG_APP_VERSION, appUrl: url};
+}
+
+function setMaintenance_(p){
+  p = p || {};
+  const on = !!p.on, by = FG_SESSION_ ? FG_SESSION_.username : 'ADMIN';
+  const m = {on:on, message:on ? s_(p.message).slice(0,200) : '', by:by,
+             at:Utilities.formatDate(new Date(), FG_CFG.TZ, 'MMM d, yyyy h:mm a')};
+  const raw = JSON.stringify(m);
+  PropertiesService.getScriptProperties().setProperty(FG_MAINT_KEY, raw);
+  CacheService.getScriptCache().put(FG_MAINT_KEY, raw, 600);
+  bumpDataVersion_();
+  try { withWriteLock_(function(){ logTxn_({type:on?'MAINTENANCE ON':'MAINTENANCE OFF', ref:'SYSTEM', marketType:'', customer:'',
+    item:'', internalCode:'', qtyIn:0, qtyOut:0, user:by, remarks:m.message || (on?'Maintenance started':'Maintenance ended')}); }); } catch(_) {}
+  return systemStatus_();
+}
+
+/** Run from the Apps Script editor if you ever get locked out: turns maintenance OFF. */
+function maintenanceOff(){
+  const raw = JSON.stringify({on:false, message:'', by:'EDITOR', at:Utilities.formatDate(new Date(), FG_CFG.TZ, 'MMM d, yyyy h:mm a')});
+  PropertiesService.getScriptProperties().setProperty(FG_MAINT_KEY, raw);
+  CacheService.getScriptCache().put(FG_MAINT_KEY, raw, 600);
+  bumpDataVersion_();
+  Logger.log('Maintenance mode is OFF.');
+}
